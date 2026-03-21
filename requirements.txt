@@ -1,0 +1,4 @@
+openai>=1.40.0
+urllib3<2
+wecom-aibot-python-sdk>=1.0.1
+pytest>=8.0.0

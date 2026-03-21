@@ -1,0 +1,1 @@
+"""WeCom translator service package."""
