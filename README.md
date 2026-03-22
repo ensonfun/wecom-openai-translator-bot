@@ -14,7 +14,7 @@ It connects to the official WeCom long-lived WebSocket channel, receives user me
 - Full input, output, and error logging
 - Daily log splitting with filenames like `app-YYYYMMDD.log`
 - OpenAI official Responses API integration
-- Official WeCom intelligent bot long-connection SDK integration
+- Official WeCom long-connection protocol integration with native `websockets`
 
 ## How It Works
 
@@ -93,6 +93,19 @@ Notes:
 source .venv/bin/activate
 python app.py
 ```
+
+For a one-command restart that kills any existing instance from this project and starts a new one in the background:
+
+```bash
+chmod +x start.sh
+./start.sh
+```
+
+The launcher will create `.venv` on first run, install dependencies from `requirements.txt`, validate the required configuration, kill any existing process for this project, and then start the service in the background.
+
+The launcher writes bootstrap output to `logs/startup.log` and stores the active PID in `.wecom_translator.pid`. If startup fails, it prints the recent log tail directly in the terminal.
+
+Run it as `./start.sh` or `bash start.sh`. Avoid `sh start.sh`, because the script uses Bash features.
 
 ## Logging
 
