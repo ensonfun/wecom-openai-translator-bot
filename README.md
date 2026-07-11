@@ -1,166 +1,50 @@
-# WeCom OpenAI Translator Bot
+# Mac Translator
 
-A translation bot for WeCom intelligent bots, powered by OpenAI.
+本项目现在以原生 macOS App 为主：从 Mac 本机直接调用 OpenAI Responses API，提供翻译、英文纠错和 Slack 文案润色，不再依赖企业微信作为消息入口。
 
-It connects to the official WeCom long-lived WebSocket channel, receives user messages from WeCom chats, applies your custom translation prompts, and sends the translated or polished result back to the same conversation.
+## macOS App
 
-## Features
+App 位于 [`MacTranslator/`](MacTranslator/)，支持原 `wecom_translator` 的相同 prompt 和命令：
 
-- Default translation to Simplified Chinese
-- `T/t` command for English correction + Chinese explanation + Chinese translation
-- `S/s` command for Slack-style message polishing
-- `*#clear` command for clearing in-memory session state
-- Direct chat and group chat support
-- Full input, output, and error logging
-- Daily log splitting with filenames like `app-YYYYMMDD.log`
-- OpenAI official Responses API integration
-- Official WeCom long-connection protocol integration with native `websockets`
+- 无前缀：翻译为简体中文
+- `t ` / `T `：英文标准化、中文解释与中文翻译
+- `s ` / `S `：Slack 风格润色
 
-## How It Works
-
-1. The service connects to WeCom over the official WebSocket long-connection channel.
-2. WeCom pushes text messages to the bot.
-3. The bot parses command prefixes and selects the matching prompt.
-4. The service sends the cleaned user text to OpenAI.
-5. The translated or polished result is sent back to the same WeCom conversation.
-
-## Commands
-
-```text
-hello world
-T she no went to the market.
-S 这个需求我晚点跟进，先回滚 prod
-*#clear
-```
-
-Command behavior:
-
-- No prefix: translate to Simplified Chinese
-- `T ` / `t `: English correction + Chinese explanation + Chinese translation
-- `S ` / `s `: Slack-style rewrite
-- `*#clear`: clear in-memory session state for the current conversation
-
-## Requirements
-
-- Python 3.9+
-- A WeCom intelligent bot with long-connection API mode enabled
-- `BotID` and long-connection `Secret`
-- An OpenAI API key
-
-## Setup
+快速运行：
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+cd MacTranslator
+swift run MacTranslator
 ```
 
-## Configuration
-
-Create a `.env` file in the project root. The application loads it automatically on startup.
-
-Minimum required variables:
-
-```env
-OPENAI_API_KEY=your_openai_api_key
-WECOM_BOT_ID=your_bot_id
-WECOM_BOT_SECRET=your_bot_secret
-```
-
-Optional variables:
-
-```env
-OPENAI_MODEL=gpt-5-mini
-WECOM_WS_URL=
-HEARTBEAT_INTERVAL_MS=30000
-RECONNECT_INTERVAL_MS=1000
-MAX_RECONNECT_ATTEMPTS=-1
-WORKER_COUNT=4
-LOG_LEVEL=INFO
-LOG_DIR=logs
-LOG_RETENTION_DAYS=14
-```
-
-Notes:
-
-- Leave `WECOM_WS_URL` empty to use the official default endpoint: `wss://openws.work.weixin.qq.com`
-- `MAX_RECONNECT_ATTEMPTS=-1` means unlimited reconnect attempts
-- The service prefers values already present in the shell and only falls back to `.env`
-
-## Run
+构建可双击运行的应用：
 
 ```bash
-source .venv/bin/activate
-python app.py
+cd MacTranslator
+./build-app.sh
+open dist/MacTranslator.app
 ```
 
-For a one-command restart that kills any existing instance from this project and starts a new one in the background:
+构建可分发的 DMG：
 
 ```bash
-chmod +x start.sh
-./start.sh
+cd MacTranslator
+./build-dmg.sh
 ```
 
-The launcher will create `.venv` on first run, install dependencies from `requirements.txt`, validate the required configuration, kill any existing process for this project, and then start the service in the background.
+推送与 App 版本一致的 tag（例如 `v1.0.0`）后，GitHub Actions 会自动创建 Release，并上传 DMG 与 SHA-256 校验文件。
 
-The launcher writes bootstrap output to `logs/startup.log` and stores the active PID in `.wecom_translator.pid`. If startup fails, it prints the recent log tail directly in the terminal.
+API Key 在 App 设置中填写并保存在 macOS Keychain。完整说明见 [`MacTranslator/README.md`](MacTranslator/README.md)。
 
-Run it as `./start.sh` or `bash start.sh`. Avoid `sh start.sh`, because the script uses Bash features.
+聊天记录会保存在 SQLite 数据库 `~/Library/Application Support/MacTranslator/chat-history.sqlite3`，重启 App 后自动恢复。界面中的 “Clear” 会清空记录，右上角导出按钮可以导出为 JSON。App 界面语言为英文。
 
-## Logging
+## 旧企业微信实现
 
-Logs are written to `logs/` and split by day:
+原 Python/企业微信长连接代码暂时保留在 `wecom_translator/`、`app.py` 和 `tests/` 中，方便核对旧行为或后续迁移；新的 macOS App 不引用这些代码，也不需要 WeCom Bot ID、Secret、WebSocket 或 Python 运行环境。
 
-- `app-YYYYMMDD.log`
-- `error-YYYYMMDD.log`
-
-Logged events include:
-
-- Input messages: message ID, chat type, sender, conversation ID, command type, raw text
-- Output messages: message ID, model, command type, output text, send result
-- Errors: stage, summary, context, and stack trace when available
-
-Sensitive values such as API keys, secrets, and tokens are masked before logging.
-
-## Project Structure
-
-```text
-wecom_translator/
-  config.py
-  logging_setup.py
-  models.py
-  prompts.py
-  runtime.py
-  router/
-  services/
-  state/
-  transport/
-tests/
-app.py
-requirements.txt
-```
-
-## Test
+旧测试仍可运行：
 
 ```bash
 source .venv/bin/activate
 pytest
 ```
-
-## Current Scope
-
-- Text messages only
-- In-memory state only
-- No database, Redis, or message queue
-- No image, voice, video, or file translation workflow yet
-
-## Deployment Notes
-
-- This project is suitable for running on a small long-lived process, such as a VM, container, or lightweight server
-- A `Dockerfile` is included for container-based deployment
-- No inbound HTTP port is required in long-connection mode; the process only needs outbound access
-- Make sure the process can reach both OpenAI and the official WeCom WebSocket endpoint
-
-## License
-
-No license file is included yet. Add one before publishing publicly if you want others to reuse the code.

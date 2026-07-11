@@ -1,0 +1,49 @@
+name: Release Mac Translator
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Verify release version
+        shell: bash
+        run: |
+          APP_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' MacTranslator/Resources/Info.plist)"
+          if [[ "v$APP_VERSION" != "$GITHUB_REF_NAME" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match app version v$APP_VERSION" >&2
+            exit 1
+          fi
+
+      - name: Build DMG
+        run: MacTranslator/build-dmg.sh
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          APP_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' MacTranslator/Resources/Info.plist)"
+          ASSETS=(
+            "MacTranslator/dist/MacTranslator-$APP_VERSION.dmg"
+            "MacTranslator/dist/MacTranslator-$APP_VERSION.dmg.sha256"
+          )
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${ASSETS[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${ASSETS[@]}" \
+              --verify-tag \
+              --title "Mac Translator $GITHUB_REF_NAME" \
+              --generate-notes \
+              --notes "Native macOS app for translation, English correction, and Slack message polishing. Universal binary for Apple Silicon and Intel Macs. The app is ad-hoc signed and not notarized."
+          fi

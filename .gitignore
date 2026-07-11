@@ -5,3 +5,7 @@ __pycache__/
 *.py[cod]
 logs/
 .wecom_translator.pid
+.DS_Store
+MacTranslator/.build*/
+MacTranslator/dist/
+*.dmg
