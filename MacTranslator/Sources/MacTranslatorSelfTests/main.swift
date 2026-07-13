@@ -13,6 +13,85 @@ func expect(_ condition: @autoclosure () -> Bool, _ message: String) {
     }
 }
 
+final class OpenAIStubURLProtocol: URLProtocol {
+    enum Outcome {
+        case connectionLostBeforeText
+        case success(String)
+        case partialTextThenConnectionLost(String)
+    }
+
+    private static let lock = NSLock()
+    private static var outcomes: [Outcome] = []
+    private static var requests = 0
+
+    static func configure(_ newOutcomes: [Outcome]) {
+        lock.lock()
+        outcomes = newOutcomes
+        requests = 0
+        lock.unlock()
+    }
+
+    static var requestCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return requests
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let outcome: Outcome
+        Self.lock.lock()
+        Self.requests += 1
+        if Self.outcomes.isEmpty {
+            outcome = .connectionLostBeforeText
+        } else {
+            outcome = Self.outcomes.removeFirst()
+        }
+        Self.lock.unlock()
+
+        switch outcome {
+        case .connectionLostBeforeText:
+            client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
+        case .success(let text):
+            sendResponse(data: Self.streamData(text: text), finish: true)
+        case .partialTextThenConnectionLost(let text):
+            sendResponse(data: Self.streamData(text: text, includeDone: false), finish: false)
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) { [self] in
+                client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
+            }
+        }
+    }
+
+    override func stopLoading() {}
+
+    private func sendResponse(data: Data, finish: Bool) {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: [
+                "Content-Type": "text/event-stream",
+                "x-request-id": "req_self_test"
+            ]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: data)
+        if finish {
+            client?.urlProtocolDidFinishLoading(self)
+        }
+    }
+
+    private static func streamData(text: String, includeDone: Bool = true) -> Data {
+        let encodedText = try! JSONEncoder().encode(text)
+        let jsonString = String(decoding: encodedText, as: UTF8.self)
+        let done = includeDone ? "data: [DONE]\n\n" : ""
+        return Data("data: {\"type\":\"response.output_text.delta\",\"delta\":\(jsonString)}\n\n\(done)".utf8)
+    }
+}
+
 let defaultCommand = CommandParser.parse("hello")
 expect(defaultCommand.mode == .translate, "无前缀使用默认翻译")
 expect(defaultCommand.userText == "hello", "默认命令保留正文")
@@ -193,6 +272,141 @@ do {
     failures += 1
     print("✗ 聊天记录持久化自检出错：\(error.localizedDescription)")
 }
+
+expect(
+    OpenAIClient.isRetryable(URLError(.networkConnectionLost)),
+    "连接中断属于可重试错误"
+)
+expect(
+    OpenAIClient.isRetryable(OpenAIClientError.api(statusCode: 503, message: "Unavailable")),
+    "HTTP 5xx 属于可重试错误"
+)
+expect(
+    !OpenAIClient.isRetryable(OpenAIClientError.api(statusCode: 401, message: "Unauthorized")),
+    "认证错误不会重试"
+)
+expect(
+    !OpenAIClient.isRetryable(OpenAIClientError.stream("Generation failed")),
+    "模型流事件错误不会重试"
+)
+
+let retryTestDirectory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("MacTranslatorRetryTests-\(UUID().uuidString)", isDirectory: true)
+defer { try? FileManager.default.removeItem(at: retryTestDirectory) }
+let retryLogger = DiagnosticLogger(
+    directoryURL: retryTestDirectory,
+    maxFileSize: 350,
+    retainedFileCount: 5
+)
+let stubConfiguration = URLSessionConfiguration.ephemeral
+stubConfiguration.protocolClasses = [OpenAIStubURLProtocol.self]
+let stubSession = URLSession(configuration: stubConfiguration)
+defer { stubSession.invalidateAndCancel() }
+let retryClient = OpenAIClient(
+    endpoint: URL(string: "https://self-test.invalid/v1/responses")!,
+    session: stubSession,
+    diagnosticLogger: retryLogger,
+    retryDelayNanoseconds: [0, 0]
+)
+let secretAPIKey = "sk-self-test-must-not-appear"
+let secretChatText = "private chat body must not appear"
+
+do {
+    OpenAIStubURLProtocol.configure([
+        .connectionLostBeforeText,
+        .connectionLostBeforeText,
+        .success("Recovered")
+    ])
+    var output = ""
+    for try await delta in retryClient.streamResponse(
+        apiKey: secretAPIKey,
+        model: "self-test-model",
+        instructions: "private instructions must not appear",
+        input: secretChatText
+    ) {
+        output += delta
+    }
+    expect(output == "Recovered", "未收到文字时最多重试两次并可在第三次恢复")
+    expect(OpenAIStubURLProtocol.requestCount == 3, "两次自动重试总计发起三次请求")
+} catch {
+    failures += 1
+    print("✗ 无文字断线重试自检出错：\(error.localizedDescription)")
+}
+
+OpenAIStubURLProtocol.configure([
+    .connectionLostBeforeText,
+    .connectionLostBeforeText,
+    .connectionLostBeforeText,
+    .success("Fourth attempt must not happen")
+])
+var exhaustedRetryDidFail = false
+do {
+    for try await _ in retryClient.streamResponse(
+        apiKey: secretAPIKey,
+        model: "self-test-model",
+        instructions: "private instructions must not appear",
+        input: secretChatText
+    ) {}
+} catch {
+    exhaustedRetryDidFail = true
+}
+expect(exhaustedRetryDidFail, "连续网络错误在两次重试后会报告失败")
+expect(OpenAIStubURLProtocol.requestCount == 3, "连续失败时不会发起第四次请求")
+
+OpenAIStubURLProtocol.configure([
+    .partialTextThenConnectionLost("Partial"),
+    .success("Should not be requested")
+])
+var partialOutput = ""
+var partialRequestDidFail = false
+do {
+    for try await delta in retryClient.streamResponse(
+        apiKey: secretAPIKey,
+        model: "self-test-model",
+        instructions: "private instructions must not appear",
+        input: secretChatText
+    ) {
+        partialOutput += delta
+    }
+} catch {
+    partialRequestDidFail = true
+}
+expect(partialRequestDidFail, "收到部分文字后断线会向界面报告错误")
+expect(partialOutput == "Partial", "收到部分文字后断线会保留已有输出")
+expect(OpenAIStubURLProtocol.requestCount == 1, "收到部分文字后不会自动重试")
+
+retryLogger.flush()
+let diagnosticFiles = ([retryLogger.logFileURL] + (1...5).map(retryLogger.archivedLogFileURL))
+    .filter { FileManager.default.fileExists(atPath: $0.path) }
+let diagnosticText = diagnosticFiles.compactMap { try? String(contentsOf: $0, encoding: .utf8) }.joined()
+expect(diagnosticFiles.count > 1, "诊断日志达到大小限制后会轮转")
+expect(diagnosticText.contains("retry_scheduled"), "诊断日志记录重试事件")
+expect(!diagnosticText.contains(secretAPIKey), "诊断日志不记录 API Key")
+expect(!diagnosticText.contains(secretChatText), "诊断日志不记录聊天正文")
+expect(!diagnosticText.contains("private instructions must not appear"), "诊断日志不记录 prompt")
+expect(!diagnosticText.contains("Recovered"), "诊断日志不记录模型返回正文")
+expect(!diagnosticText.contains("Partial"), "诊断日志不记录部分模型返回正文")
+
+let oldestRequestID = UUID()
+retryLogger.requestStarted(requestID: oldestRequestID, attempt: 1)
+retryLogger.flush()
+for _ in 0..<30 {
+    retryLogger.requestStarted(requestID: UUID(), attempt: 1)
+}
+retryLogger.flush()
+let retainedDiagnosticFiles = ([retryLogger.logFileURL] + (1...5).map(retryLogger.archivedLogFileURL))
+    .filter { FileManager.default.fileExists(atPath: $0.path) }
+let retainedDiagnosticText = retainedDiagnosticFiles
+    .compactMap { try? String(contentsOf: $0, encoding: .utf8) }
+    .joined()
+expect(
+    !FileManager.default.fileExists(atPath: retryLogger.archivedLogFileURL(index: 6).path),
+    "诊断日志最多保留五个归档文件"
+)
+expect(
+    !retainedDiagnosticText.contains(oldestRequestID.uuidString),
+    "超过轮转保留数量后会删除最旧日志"
+)
 
 if CommandLine.arguments.contains("--live-openai") {
     do {
