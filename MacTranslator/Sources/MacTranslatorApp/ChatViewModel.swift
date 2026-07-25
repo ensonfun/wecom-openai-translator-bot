@@ -21,6 +21,7 @@ final class ChatViewModel: ObservableObject {
     private let keychain: KeychainStore
     private let client: OpenAIClient
     private let historyStore: ChatHistoryStore
+    private let diagnosticLogger: DiagnosticLogger
     private let historyQueue = DispatchQueue(label: "com.mario.MacTranslator.history", qos: .utility)
     private var pendingTextUpdates: [UUID: DispatchWorkItem] = [:]
     private var requestTask: Task<Void, Never>?
@@ -29,18 +30,37 @@ final class ChatViewModel: ObservableObject {
     init(
         keychain: KeychainStore = KeychainStore(),
         client: OpenAIClient = OpenAIClient(),
-        historyStore: ChatHistoryStore = ChatHistoryStore()
+        historyStore: ChatHistoryStore = ChatHistoryStore(),
+        diagnosticLogger: DiagnosticLogger = .shared
     ) {
         self.keychain = keychain
         self.client = client
         self.historyStore = historyStore
+        self.diagnosticLogger = diagnosticLogger
         migrateUnavailablePreviewModel()
 
         do {
             messages = try historyStore.load()
+            diagnosticLogger.event(
+                "chat_history_loaded",
+                component: "chat",
+                details: [
+                    "message_count": .integer(messages.count),
+                    "database_path": .string(historyStore.databaseURL.path)
+                ]
+            )
         } catch {
             messages = []
             errorMessage = error.localizedDescription
+            diagnosticLogger.event(
+                "chat_history_load_failed",
+                level: .error,
+                component: "chat",
+                failure: DiagnosticFailure.from(error),
+                details: [
+                    "database_path": .string(historyStore.databaseURL.path)
+                ]
+            )
         }
 
         refreshCredentials()
@@ -64,6 +84,11 @@ final class ChatViewModel: ObservableObject {
 
     func refreshCredentials() {
         hasAPIKey = resolvedAPIKey() != nil
+        diagnosticLogger.event(
+            "credential_availability_checked",
+            component: "chat",
+            details: ["api_key_available": .boolean(hasAPIKey)]
+        )
     }
 
     func send() {
@@ -71,11 +96,40 @@ final class ChatViewModel: ObservableObject {
             input,
             prompts: PromptConfiguration.stored()
         )
-        guard !command.cleanedText.isEmpty else { return }
-        guard !command.userText.isEmpty, let instructions = command.instructions else { return }
+        guard !command.cleanedText.isEmpty else {
+            diagnosticLogger.event(
+                "chat_send_ignored",
+                level: .debug,
+                component: "chat",
+                details: ["reason": .string("empty_input")]
+            )
+            return
+        }
+        guard !command.userText.isEmpty, let instructions = command.instructions else {
+            diagnosticLogger.event(
+                "chat_send_ignored",
+                level: .warning,
+                component: "chat",
+                details: [
+                    "reason": .string("command_without_body"),
+                    "input": .string(input)
+                ]
+            )
+            return
+        }
         guard let apiKey = resolvedAPIKey(), !apiKey.isEmpty else {
             errorMessage = "Save your OpenAI API key in Settings before sending a message."
             hasAPIKey = false
+            diagnosticLogger.event(
+                "chat_send_blocked",
+                level: .warning,
+                component: "chat",
+                details: [
+                    "reason": .string("missing_api_key"),
+                    "mode": .string(command.mode.rawValue),
+                    "input": .string(command.userText)
+                ]
+            )
             return
         }
 
@@ -116,6 +170,21 @@ final class ChatViewModel: ObservableObject {
             model: model,
             promptFingerprint: PromptFingerprint.make(instructions)
         )
+        diagnosticLogger.event(
+            "chat_turn_started",
+            component: "chat",
+            operationID: turnID,
+            details: [
+                "mode": .string(command.mode.rawValue),
+                "model": .string(model),
+                "input": .string(command.userText),
+                "instructions": .string(instructions),
+                "input_chars": .integer(command.userText.count),
+                "prompt_fingerprint": .string(turn.promptFingerprint),
+                "user_message_id": .string(userMessage.id.uuidString),
+                "assistant_message_id": .string(responseID.uuidString)
+            ]
+        )
         persistTurn(turn)
         isSending = true
 
@@ -127,7 +196,12 @@ final class ChatViewModel: ObservableObject {
                     apiKey: apiKey,
                     model: model,
                     instructions: instructions,
-                    input: command.userText
+                    input: command.userText,
+                    diagnosticContext: DiagnosticRequestContext(
+                        flow: "chat",
+                        operationID: turnID,
+                        details: ["mode": .string(command.mode.rawValue)]
+                    )
                 )
                 for try await delta in stream {
                     append(delta, to: responseID)
@@ -138,16 +212,47 @@ final class ChatViewModel: ObservableObject {
             } catch is CancellationError {
                 finalStatus = .cancelled
                 removeMessageIfEmpty(id: responseID)
+                diagnosticLogger.event(
+                    "chat_turn_cancelled",
+                    level: .warning,
+                    component: "chat",
+                    operationID: turnID
+                )
             } catch {
                 finalStatus = .failed
                 removeMessageIfEmpty(id: responseID)
                 errorMessage = error.localizedDescription
+                diagnosticLogger.event(
+                    "chat_turn_failed",
+                    level: .error,
+                    component: "chat",
+                    operationID: turnID,
+                    failure: DiagnosticFailure.from(error),
+                    details: [
+                        "mode": .string(command.mode.rawValue),
+                        "partial_output": .string(messageText(for: responseID))
+                    ]
+                )
             }
             persistMessageImmediately(id: responseID)
             var completedTurn = turn
             completedTurn.completedAt = Date()
             completedTurn.status = finalStatus
             persistTurnImmediately(completedTurn)
+            diagnosticLogger.event(
+                "chat_turn_finished",
+                component: "chat",
+                operationID: turnID,
+                details: [
+                    "status": .string(finalStatus.rawValue),
+                    "mode": .string(command.mode.rawValue),
+                    "output": .string(messageText(for: responseID)),
+                    "output_chars": .integer(messageText(for: responseID).count),
+                    "duration_ms": .integer(
+                        max(0, Int(Date().timeIntervalSince(createdAt) * 1_000))
+                    )
+                ]
+            )
             if command.mode == .correct || command.mode == .slack {
                 NotificationCenter.default.post(
                     name: .translatorChatHistoryDidChange,
@@ -160,10 +265,16 @@ final class ChatViewModel: ObservableObject {
     }
 
     func cancel() {
+        diagnosticLogger.event(
+            "chat_cancel_requested",
+            level: .warning,
+            component: "chat"
+        )
         requestTask?.cancel()
     }
 
     func clearConversation() {
+        let removedCount = messages.count
         requestTask?.cancel()
         requestTask = nil
         cancelPendingUpdates()
@@ -171,7 +282,22 @@ final class ChatViewModel: ObservableObject {
         errorMessage = nil
         isSending = false
         historyQueue.sync {
-            try? historyStore.clear()
+            do {
+                try historyStore.clear()
+                diagnosticLogger.event(
+                    "chat_history_cleared",
+                    component: "chat",
+                    details: ["removed_message_count": .integer(removedCount)]
+                )
+            } catch {
+                diagnosticLogger.event(
+                    "chat_history_clear_failed",
+                    level: .error,
+                    component: "chat",
+                    failure: DiagnosticFailure.from(error),
+                    details: ["removed_message_count": .integer(removedCount)]
+                )
+            }
         }
     }
 
@@ -192,8 +318,23 @@ final class ChatViewModel: ObservableObject {
         guard panel.runModal() == .OK, let destinationURL = panel.url else { return }
         do {
             try historyStore.exportJSON(to: destinationURL)
+            diagnosticLogger.event(
+                "chat_history_exported",
+                component: "chat",
+                details: [
+                    "destination": .string(destinationURL.path),
+                    "message_count": .integer(messages.count)
+                ]
+            )
         } catch {
             errorMessage = error.localizedDescription
+            diagnosticLogger.event(
+                "chat_history_export_failed",
+                level: .error,
+                component: "chat",
+                failure: DiagnosticFailure.from(error),
+                details: ["destination": .string(destinationURL.path)]
+            )
         }
     }
 
@@ -207,6 +348,14 @@ final class ChatViewModel: ObservableObject {
         let resolvedModel = AppSettings.resolvedModel(configuredModel)
         if configuredModel != nil, configuredModel != resolvedModel {
             defaults.set(resolvedModel, forKey: AppSettings.modelKey)
+            diagnosticLogger.event(
+                "model_setting_migrated",
+                component: "settings",
+                details: [
+                    "previous_model": .string(configuredModel ?? ""),
+                    "resolved_model": .string(resolvedModel)
+                ]
+            )
         }
     }
 
@@ -231,33 +380,91 @@ final class ChatViewModel: ObservableObject {
         pendingTextUpdates[id]?.cancel()
         pendingTextUpdates[id] = nil
         messages.remove(at: index)
-        historyQueue.async { [historyStore] in
-            try? historyStore.delete(id: id)
+        historyQueue.async { [historyStore, diagnosticLogger] in
+            do {
+                try historyStore.delete(id: id)
+            } catch {
+                diagnosticLogger.event(
+                    "chat_message_delete_failed",
+                    level: .error,
+                    component: "storage",
+                    operationID: id,
+                    failure: DiagnosticFailure.from(error)
+                )
+            }
         }
     }
 
     private func persistNewMessage(_ message: ChatMessage, position: Int) {
-        historyQueue.async { [historyStore] in
-            try? historyStore.upsert(message, position: position)
+        historyQueue.async { [historyStore, diagnosticLogger] in
+            do {
+                try historyStore.upsert(message, position: position)
+            } catch {
+                diagnosticLogger.event(
+                    "chat_message_insert_failed",
+                    level: .error,
+                    component: "storage",
+                    operationID: message.turnID ?? message.id,
+                    failure: DiagnosticFailure.from(error),
+                    details: [
+                        "message_id": .string(message.id.uuidString),
+                        "role": .string(message.role.rawValue),
+                        "position": .integer(position),
+                        "text": .string(message.text)
+                    ]
+                )
+            }
         }
     }
 
     private func persistTurn(_ turn: ChatTurn) {
-        historyQueue.async { [historyStore] in
-            try? historyStore.upsertTurn(turn)
+        historyQueue.async { [historyStore, diagnosticLogger] in
+            do {
+                try historyStore.upsertTurn(turn)
+            } catch {
+                diagnosticLogger.event(
+                    "chat_turn_insert_failed",
+                    level: .error,
+                    component: "storage",
+                    operationID: turn.id,
+                    failure: DiagnosticFailure.from(error)
+                )
+            }
         }
     }
 
     private func persistTurnImmediately(_ turn: ChatTurn) {
         historyQueue.sync {
-            try? historyStore.upsertTurn(turn)
+            do {
+                try historyStore.upsertTurn(turn)
+            } catch {
+                diagnosticLogger.event(
+                    "chat_turn_update_failed",
+                    level: .error,
+                    component: "storage",
+                    operationID: turn.id,
+                    failure: DiagnosticFailure.from(error),
+                    details: ["status": .string(turn.status.rawValue)]
+                )
+            }
         }
     }
 
     private func persistTextDebounced(id: UUID, text: String) {
         pendingTextUpdates[id]?.cancel()
-        let workItem = DispatchWorkItem { [historyStore] in
-            try? historyStore.updateText(id: id, text: text)
+        let workItem = DispatchWorkItem { [historyStore, diagnosticLogger] in
+            do {
+                try historyStore.updateText(id: id, text: text)
+            } catch {
+                diagnosticLogger.event(
+                    "chat_message_stream_persist_failed",
+                    level: .error,
+                    component: "storage",
+                    operationID: id,
+                    failure: DiagnosticFailure.from(error),
+                    details: ["text": .string(text)]
+                )
+            }
         }
         pendingTextUpdates[id] = workItem
         historyQueue.asyncAfter(deadline: .now() + .milliseconds(450), execute: workItem)
@@ -270,11 +477,35 @@ final class ChatViewModel: ObservableObject {
         if let index = messages.firstIndex(where: { $0.id == id }) {
             let message = messages[index]
             historyQueue.sync {
-                try? historyStore.upsert(message, position: index)
+                do {
+                    try historyStore.upsert(message, position: index)
+                } catch {
+                    diagnosticLogger.event(
+                        "chat_message_final_persist_failed",
+                        level: .error,
+                        component: "storage",
+                        operationID: message.turnID ?? message.id,
+                        failure: DiagnosticFailure.from(error),
+                        details: [
+                            "message_id": .string(message.id.uuidString),
+                            "text": .string(message.text)
+                        ]
+                    )
+                }
             }
         } else {
             historyQueue.sync {
-                try? historyStore.delete(id: id)
+                do {
+                    try historyStore.delete(id: id)
+                } catch {
+                    diagnosticLogger.event(
+                        "chat_message_cleanup_failed",
+                        level: .error,
+                        component: "storage",
+                        operationID: id,
+                        failure: DiagnosticFailure.from(error)
+                    )
+                }
             }
         }
     }
@@ -290,7 +521,22 @@ final class ChatViewModel: ObservableObject {
         cancelPendingUpdates()
         let snapshot = messages
         historyQueue.sync {
-            try? historyStore.replaceAll(snapshot)
+            do {
+                try historyStore.replaceAll(snapshot)
+                diagnosticLogger.event(
+                    "chat_history_flushed",
+                    component: "storage",
+                    details: ["message_count": .integer(snapshot.count)]
+                )
+            } catch {
+                diagnosticLogger.event(
+                    "chat_history_flush_failed",
+                    level: .error,
+                    component: "storage",
+                    failure: DiagnosticFailure.from(error),
+                    details: ["message_count": .integer(snapshot.count)]
+                )
+            }
         }
     }
 }

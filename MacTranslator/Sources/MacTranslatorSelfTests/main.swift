@@ -168,7 +168,17 @@ if let optionIndex = CommandLine.arguments.firstIndex(of: "--database-directory"
         let history = ChatHistoryStore(directoryURL: directoryURL)
         let messages = try history.load()
         let turns = try history.learningSourceTurns()
-        let dashboard = try LearningStore(directoryURL: directoryURL).dashboard()
+        let validationLogger = DiagnosticLogger(
+            directoryURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent(
+                    "MacTranslatorMigrationLogs-\(UUID().uuidString)",
+                    isDirectory: true
+                )
+        )
+        let dashboard = try LearningStore(
+            directoryURL: directoryURL,
+            diagnosticLogger: validationLogger
+        ).dashboard()
         print(
             "Migration validation passed: "
                 + "\(messages.count) messages, "
@@ -457,7 +467,13 @@ do {
 let learningTestDirectory = FileManager.default.temporaryDirectory
     .appendingPathComponent("MacTranslatorLearningTests-\(UUID().uuidString)", isDirectory: true)
 defer { try? FileManager.default.removeItem(at: learningTestDirectory) }
-let learningStore = LearningStore(directoryURL: learningTestDirectory)
+let learningTestLogger = DiagnosticLogger(
+    directoryURL: learningTestDirectory.appendingPathComponent("logs", isDirectory: true)
+)
+let learningStore = LearningStore(
+    directoryURL: learningTestDirectory,
+    diagnosticLogger: learningTestLogger
+)
 
 do {
     let sourceTurnID = UUID()
@@ -684,7 +700,7 @@ let retryTestDirectory = FileManager.default.temporaryDirectory
 defer { try? FileManager.default.removeItem(at: retryTestDirectory) }
 let retryLogger = DiagnosticLogger(
     directoryURL: retryTestDirectory,
-    maxFileSize: 350,
+    maxFileSize: 2_000_000,
     retainedFileCount: 5
 )
 let stubConfiguration = URLSessionConfiguration.ephemeral
@@ -796,34 +812,121 @@ retryLogger.flush()
 let diagnosticFiles = ([retryLogger.logFileURL] + (1...5).map(retryLogger.archivedLogFileURL))
     .filter { FileManager.default.fileExists(atPath: $0.path) }
 let diagnosticText = diagnosticFiles.compactMap { try? String(contentsOf: $0, encoding: .utf8) }.joined()
-expect(diagnosticFiles.count > 1, "诊断日志达到大小限制后会轮转")
 expect(diagnosticText.contains("retry_scheduled"), "诊断日志记录重试事件")
 expect(!diagnosticText.contains(secretAPIKey), "诊断日志不记录 API Key")
-expect(!diagnosticText.contains(secretChatText), "诊断日志不记录聊天正文")
-expect(!diagnosticText.contains("private instructions must not appear"), "诊断日志不记录 prompt")
-expect(!diagnosticText.contains("Recovered"), "诊断日志不记录模型返回正文")
-expect(!diagnosticText.contains("Partial"), "诊断日志不记录部分模型返回正文")
+expect(diagnosticText.contains(secretChatText), "诊断日志记录聊天正文以便事后定位")
+expect(diagnosticText.contains("private instructions must not appear"), "诊断日志记录 prompt")
+expect(diagnosticText.contains("Recovered"), "诊断日志记录完整模型输出")
+expect(diagnosticText.contains("Partial"), "诊断日志记录失败前的部分模型输出")
+expect(diagnosticText.contains("self-test-model"), "诊断日志记录请求模型")
+expect(diagnosticText.contains("response_received"), "诊断日志记录 HTTP 响应阶段")
+expect(diagnosticText.contains("response_headers"), "诊断日志记录 HTTP 响应头")
+expect(diagnosticText.contains("stream_done_received"), "诊断日志记录流式完成标记")
 
-let oldestRequestID = UUID()
-retryLogger.requestStarted(requestID: oldestRequestID, attempt: 1)
+retryLogger.event(
+    "redaction_probe",
+    component: "self_test",
+    details: [
+        "chat_text": .string("before \(secretAPIKey) after"),
+        "authorization": .string("Bearer \(secretAPIKey)")
+    ]
+)
 retryLogger.flush()
-for _ in 0..<30 {
-    retryLogger.requestStarted(requestID: UUID(), attempt: 1)
+let redactionProbeText = (try? String(contentsOf: retryLogger.logFileURL, encoding: .utf8))
+    ?? ""
+expect(redactionProbeText.contains("before <redacted-api-key> after"), "聊天正文中的 API Key 会脱敏")
+expect(redactionProbeText.contains("Bearer <redacted-api-key>"), "Authorization 形式的 API Key 会脱敏")
+expect(!redactionProbeText.contains(secretAPIKey), "脱敏测试不会泄露 API Key")
+
+retryLogger.event(
+    "synchronous_error_probe",
+    level: .error,
+    component: "self_test",
+    failure: DiagnosticFailure(
+        statusCode: 500,
+        errorDomain: "SelfTest",
+        errorCode: 500,
+        message: "Persist immediately"
+    )
+)
+let immediateErrorText = (try? String(
+    contentsOf: retryLogger.logFileURL,
+    encoding: .utf8
+)) ?? ""
+expect(
+    immediateErrorText.contains("synchronous_error_probe"),
+    "错误日志会同步落盘"
+)
+
+let exportedDiagnosticURL = retryTestDirectory.appendingPathComponent(
+    "MacTranslator-Diagnostics.jsonl"
+)
+do {
+    try retryLogger.exportArchive(to: exportedDiagnosticURL)
+    let exportedText = try String(contentsOf: exportedDiagnosticURL, encoding: .utf8)
+    let exportedLines = exportedText.split(separator: "\n")
+    let allLinesAreJSON = exportedLines.allSatisfy {
+        guard let data = String($0).data(using: .utf8) else { return false }
+        return (try? JSONSerialization.jsonObject(with: data)) != nil
+    }
+    expect(exportedText.contains(secretChatText), "导出的诊断日志包含完整问题上下文")
+    expect(exportedText.contains("Recovered"), "导出的诊断日志包含模型结果")
+    expect(!exportedText.contains(secretAPIKey), "导出的诊断日志不包含 API Key")
+    expect(allLinesAreJSON, "导出的每一行都是有效 JSON")
+} catch {
+    failures += 1
+    print("✗ 诊断日志导出自检出错：\(error.localizedDescription)")
 }
-retryLogger.flush()
-let retainedDiagnosticFiles = ([retryLogger.logFileURL] + (1...5).map(retryLogger.archivedLogFileURL))
+
+let rotationTestDirectory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("MacTranslatorLogRotation-\(UUID().uuidString)", isDirectory: true)
+defer { try? FileManager.default.removeItem(at: rotationTestDirectory) }
+let rotationLogger = DiagnosticLogger(
+    directoryURL: rotationTestDirectory,
+    maxFileSize: 350,
+    retainedFileCount: 5
+)
+let oldestRequestID = UUID()
+rotationLogger.requestStarted(requestID: oldestRequestID, attempt: 1)
+rotationLogger.flush()
+for _ in 0..<30 {
+    rotationLogger.requestStarted(requestID: UUID(), attempt: 1)
+}
+rotationLogger.flush()
+let retainedDiagnosticFiles = (
+    [rotationLogger.logFileURL] + (1...5).map(rotationLogger.archivedLogFileURL)
+)
     .filter { FileManager.default.fileExists(atPath: $0.path) }
 let retainedDiagnosticText = retainedDiagnosticFiles
     .compactMap { try? String(contentsOf: $0, encoding: .utf8) }
     .joined()
+expect(retainedDiagnosticFiles.count > 1, "诊断日志达到大小限制后会轮转")
 expect(
-    !FileManager.default.fileExists(atPath: retryLogger.archivedLogFileURL(index: 6).path),
+    !FileManager.default.fileExists(atPath: rotationLogger.archivedLogFileURL(index: 6).path),
     "诊断日志最多保留五个归档文件"
 )
 expect(
     !retainedDiagnosticText.contains(oldestRequestID.uuidString),
     "超过轮转保留数量后会删除最旧日志"
 )
+
+let lifecycleTestDirectory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("MacTranslatorLifecycleLogs-\(UUID().uuidString)", isDirectory: true)
+defer { try? FileManager.default.removeItem(at: lifecycleTestDirectory) }
+let interruptedLogger = DiagnosticLogger(directoryURL: lifecycleTestDirectory)
+interruptedLogger.startApplicationSession(
+    details: ["app_version": .string("self-test")]
+)
+let restartedLogger = DiagnosticLogger(directoryURL: lifecycleTestDirectory)
+restartedLogger.startApplicationSession(
+    details: ["app_version": .string("self-test")]
+)
+restartedLogger.endApplicationSession()
+let lifecycleText = (try? String(contentsOf: restartedLogger.logFileURL, encoding: .utf8))
+    ?? ""
+expect(lifecycleText.contains("application_started"), "诊断日志记录程序启动")
+expect(lifecycleText.contains("application_terminated"), "诊断日志记录正常退出")
+expect(lifecycleText.contains("previous_session_unclosed"), "下次启动会识别上次异常退出")
 
 if CommandLine.arguments.contains("--live-openai") {
     do {
@@ -846,9 +949,17 @@ if CommandLine.arguments.contains("--live-openai") {
         let model = AppSettings.resolvedModel(
             appDefaults?.string(forKey: AppSettings.modelKey)
         )
+        let liveDiagnosticDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "MacTranslatorLiveDiagnostics-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        defer { try? FileManager.default.removeItem(at: liveDiagnosticDirectory) }
+        let liveLogger = DiagnosticLogger(directoryURL: liveDiagnosticDirectory)
+        let liveClient = OpenAIClient(diagnosticLogger: liveLogger)
         liveStage("streaming request with \(model)")
         var output = ""
-        for try await delta in OpenAIClient().streamResponse(
+        for try await delta in liveClient.streamResponse(
             apiKey: apiKey,
             model: model,
             instructions: "Reply with exactly one short word.",
@@ -859,7 +970,7 @@ if CommandLine.arguments.contains("--live-openai") {
         expect(!output.isEmpty, "真实 OpenAI 流式请求成功（model: \(model)）")
 
         liveStage("structured request")
-        let liveStructured: StructuredSelfTestOutput = try await OpenAIClient().structuredResponse(
+        let liveStructured: StructuredSelfTestOutput = try await liveClient.structuredResponse(
             apiKey: apiKey,
             model: model,
             instructions: "Return the requested value as structured JSON.",
@@ -876,7 +987,10 @@ if CommandLine.arguments.contains("--live-openai") {
             .appendingPathComponent("MacTranslatorLiveLearning-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: liveLearningDirectory) }
         let liveHistoryStore = ChatHistoryStore(directoryURL: liveLearningDirectory)
-        let liveLearningStore = LearningStore(directoryURL: liveLearningDirectory)
+        let liveLearningStore = LearningStore(
+            directoryURL: liveLearningDirectory,
+            diagnosticLogger: liveLogger
+        )
         let liveTurnID = UUID()
         let liveUserMessage = ChatMessage(
             role: .user,
@@ -894,7 +1008,9 @@ if CommandLine.arguments.contains("--live-openai") {
         try liveHistoryStore.upsert(liveAssistantMessage, position: 1)
         let liveEngine = LearningEngine(
             historyStore: liveHistoryStore,
-            learningStore: liveLearningStore
+            learningStore: liveLearningStore,
+            client: liveClient,
+            diagnosticLogger: liveLogger
         )
         let liveSync = try await liveEngine.syncHistory(apiKey: apiKey, model: model)
         expect(

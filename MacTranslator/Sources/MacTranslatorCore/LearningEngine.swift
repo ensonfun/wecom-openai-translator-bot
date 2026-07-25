@@ -4,15 +4,18 @@ public actor LearningEngine {
     private let historyStore: ChatHistoryStore
     private let learningStore: LearningStore
     private let client: OpenAIClient
+    private let diagnosticLogger: DiagnosticLogger
 
     public init(
         historyStore: ChatHistoryStore = ChatHistoryStore(),
         learningStore: LearningStore = LearningStore(),
-        client: OpenAIClient = OpenAIClient()
+        client: OpenAIClient = OpenAIClient(),
+        diagnosticLogger: DiagnosticLogger = .shared
     ) {
         self.historyStore = historyStore
         self.learningStore = learningStore
         self.client = client
+        self.diagnosticLogger = diagnosticLogger
     }
 
     public func loadDashboard() throws -> LearningDashboard {
@@ -23,12 +26,33 @@ public actor LearningEngine {
         apiKey: String,
         model: String
     ) async throws -> LearningSyncResult {
+        let syncID = UUID()
         let sourceTurns = try historyStore.learningSourceTurns()
         let analyzedIDs = try learningStore.analyzedTurnIDs(
             analyzerVersion: LearningPromptContracts.analyzerVersion
         )
         let pending = sourceTurns.filter { !analyzedIDs.contains($0.id) }
+        diagnosticLogger.event(
+            "learning_sync_started",
+            component: "learn",
+            operationID: syncID,
+            details: [
+                "source_turn_count": .integer(sourceTurns.count),
+                "already_analyzed_count": .integer(analyzedIDs.count),
+                "pending_turn_count": .integer(pending.count),
+                "model": .string(model)
+            ]
+        )
         guard !pending.isEmpty else {
+            diagnosticLogger.event(
+                "learning_sync_finished",
+                component: "learn",
+                operationID: syncID,
+                details: [
+                    "analyzed_turn_count": .integer(0),
+                    "evidence_count": .integer(0)
+                ]
+            )
             return LearningSyncResult(analyzedTurnCount: 0, evidenceCount: 0)
         }
 
@@ -39,7 +63,8 @@ public actor LearningEngine {
             let result = try await analyze(
                 batch,
                 apiKey: apiKey,
-                model: model
+                model: model,
+                operationID: syncID
             )
             let byID = Dictionary(uniqueKeysWithValues: result.turns.map { ($0.turnID, $0) })
             let expected = Set(batch.map(\.id))
@@ -146,7 +171,30 @@ public actor LearningEngine {
                 evidenceCount += acceptedEvidence
             }
             try learningStore.append(events)
+            diagnosticLogger.event(
+                "learning_analysis_batch_persisted",
+                component: "learn",
+                operationID: syncID,
+                details: [
+                    "turn_ids": .strings(batch.map { $0.id.uuidString }),
+                    "event_count": .integer(events.count),
+                    "batch_evidence_count": .integer(
+                        events.filter {
+                            $0.type != .sourceTurnAnalysisCompleted
+                        }.count
+                    )
+                ]
+            )
         }
+        diagnosticLogger.event(
+            "learning_sync_finished",
+            component: "learn",
+            operationID: syncID,
+            details: [
+                "analyzed_turn_count": .integer(analyzedCount),
+                "evidence_count": .integer(evidenceCount)
+            ]
+        )
         return LearningSyncResult(
             analyzedTurnCount: analyzedCount,
             evidenceCount: evidenceCount
@@ -159,6 +207,17 @@ public actor LearningEngine {
     ) async throws -> LearningDashboard {
         let dashboard = try learningStore.dashboard()
         if let session = dashboard.activeSession {
+            diagnosticLogger.event(
+                "learning_session_resumed",
+                component: "learn",
+                operationID: session.id,
+                details: [
+                    "attempt_count": .integer(session.attempts.count),
+                    "focus_knowledge_point_id": .string(
+                        session.focusKnowledgePointID ?? ""
+                    )
+                ]
+            )
             return try await recover(
                 session: session,
                 apiKey: apiKey,
@@ -199,6 +258,18 @@ public actor LearningEngine {
                 payload: focusPayload
             )
         ])
+        diagnosticLogger.event(
+            "learning_session_started",
+            component: "learn",
+            operationID: sessionID,
+            details: [
+                "focus_knowledge_point_id": .string(focus.id),
+                "focus_title": .string(focus.title),
+                "focus_reason": .string(reason),
+                "mastery": .double(focus.mastery),
+                "lifecycle": .string(focus.lifecycle.rawValue)
+            ]
+        )
         return try await generateNextQuestion(
             sessionID: sessionID,
             apiKey: apiKey,
@@ -229,6 +300,15 @@ public actor LearningEngine {
                     producer: "learner",
                     payload: payload
                 )
+            )
+            diagnosticLogger.event(
+                "learning_hint_requested",
+                component: "learn",
+                operationID: session.id,
+                details: [
+                    "question_id": .string(attempt.question.id.uuidString),
+                    "hint": .string(attempt.question.hint)
+                ]
             )
         }
         return try learningStore.dashboard()
@@ -270,6 +350,16 @@ public actor LearningEngine {
                     producer: "learner",
                     payload: payload
                 )
+            )
+            diagnosticLogger.event(
+                "learning_answer_submitted",
+                component: "learn",
+                operationID: session.id,
+                details: [
+                    "answer_id": .string(answerID.uuidString),
+                    "question_id": .string(attempt.question.id.uuidString),
+                    "answer": .string(trimmed)
+                ]
             )
         }
         return try await gradePendingAnswer(
@@ -360,6 +450,16 @@ public actor LearningEngine {
                 payload: payload
             )
         )
+        diagnosticLogger.event(
+            "learning_question_skipped",
+            component: "learn",
+            operationID: session.id,
+            details: [
+                "question_id": .string(attempt.question.id.uuidString),
+                "prompt": .string(attempt.question.prompt),
+                "ordinal": .integer(attempt.question.ordinal)
+            ]
+        )
         if session.attempts.count >= 7 {
             let refreshed = try learningStore.dashboard()
             guard let active = refreshed.activeSession else { return refreshed }
@@ -390,21 +490,40 @@ public actor LearningEngine {
 
     public func resetProgress() throws -> LearningDashboard {
         try learningStore.startNewEpoch(keepExtractedEvidence: true)
+        diagnosticLogger.event(
+            "learning_progress_reset",
+            level: .warning,
+            component: "learn"
+        )
         return try learningStore.dashboard()
     }
 
     public func deleteAllLearningData() throws -> LearningDashboard {
         try learningStore.deleteAllLearningData()
+        diagnosticLogger.event(
+            "learning_data_deleted",
+            level: .warning,
+            component: "learn"
+        )
         return try learningStore.dashboard()
     }
 
     public func rebuildProfile() throws -> LearningDashboard {
         try learningStore.rebuildProjections()
+        diagnosticLogger.event(
+            "learning_profile_rebuilt",
+            component: "learn"
+        )
         return try learningStore.dashboard()
     }
 
     public func exportEvents(to destinationURL: URL) throws {
         try learningStore.exportEvents(to: destinationURL)
+        diagnosticLogger.event(
+            "learning_events_exported",
+            component: "learn",
+            details: ["destination": .string(destinationURL.path)]
+        )
     }
 
     private func recover(
@@ -439,7 +558,8 @@ public actor LearningEngine {
     private func analyze(
         _ turns: [LearningSourceTurn],
         apiKey: String,
-        model: String
+        model: String,
+        operationID: UUID
     ) async throws -> HistoryAnalysisResult {
         let input = HistoryAnalysisInput(
             taxonomyVersion: LearningTaxonomy.version,
@@ -460,6 +580,14 @@ public actor LearningEngine {
             schemaName: "english_history_analysis",
             schema: LearningPromptContracts.historyAnalysisSchema,
             maxOutputTokens: 4_000,
+            diagnosticContext: DiagnosticRequestContext(
+                flow: "learning_history_analysis",
+                operationID: operationID,
+                details: [
+                    "turn_ids": .strings(turns.map { $0.id.uuidString }),
+                    "turn_count": .integer(turns.count)
+                ]
+            ),
             outputType: HistoryAnalysisResult.self
         )
     }
@@ -500,6 +628,15 @@ public actor LearningEngine {
             schemaName: "english_learning_question",
             schema: LearningPromptContracts.questionSchema,
             maxOutputTokens: 1_200,
+            diagnosticContext: DiagnosticRequestContext(
+                flow: "learning_question_generation",
+                operationID: session.id,
+                details: [
+                    "knowledge_point_id": .string(focus.id),
+                    "question_type": .string(requestedType.rawValue),
+                    "question_ordinal": .integer(session.attempts.count + 1)
+                ]
+            ),
             outputType: GeneratedLearningQuestion.self
         )
         guard generated.type == requestedType,
@@ -533,6 +670,22 @@ public actor LearningEngine {
                 promptVersion: LearningPromptContracts.questionVersion,
                 payload: question
             )
+        )
+        diagnosticLogger.event(
+            "learning_question_presented",
+            component: "learn",
+            operationID: session.id,
+            details: [
+                "question_id": .string(question.id.uuidString),
+                "ordinal": .integer(question.ordinal),
+                "knowledge_point_id": .string(focus.id),
+                "question_type": .string(question.type.rawValue),
+                "prompt": .string(question.prompt),
+                "context": .string(question.context),
+                "hint": .string(question.hint),
+                "rubric": .string(question.rubric),
+                "reference_answer": .string(question.referenceAnswer)
+            ]
         )
         return try learningStore.dashboard()
     }
@@ -568,6 +721,17 @@ public actor LearningEngine {
             schemaName: "english_answer_grade",
             schema: LearningPromptContracts.gradeSchema,
             maxOutputTokens: 1_500,
+            diagnosticContext: DiagnosticRequestContext(
+                flow: "learning_answer_grading",
+                operationID: session.id,
+                details: [
+                    "question_id": .string(attempt.question.id.uuidString),
+                    "answer_id": .string(answerID.uuidString),
+                    "knowledge_point_id": .string(
+                        attempt.question.knowledgePointID
+                    )
+                ]
+            ),
             outputType: GeneratedLearningGrade.self
         )
         let normalizedConfidence = min(1, max(0, generated.confidence))
@@ -625,6 +789,22 @@ public actor LearningEngine {
                 payload: explanation
             )
         ])
+        diagnosticLogger.event(
+            "learning_answer_graded",
+            component: "learn",
+            operationID: session.id,
+            details: [
+                "question_id": .string(attempt.question.id.uuidString),
+                "answer_id": .string(answerID.uuidString),
+                "verdict": .string(grade.verdict.rawValue),
+                "confidence": .double(grade.confidence),
+                "target_demonstrated": .boolean(grade.targetDemonstrated),
+                "corrected_answer": .string(grade.correctedAnswer),
+                "explanation_zh": .string(grade.explanationZH),
+                "issues": .strings(grade.issues),
+                "follow_up": .string(grade.followUp.rawValue)
+            ]
+        )
         return try learningStore.dashboard()
     }
 
@@ -649,6 +829,22 @@ public actor LearningEngine {
                 producer: "tutor",
                 payload: payload
             )
+        )
+        diagnosticLogger.event(
+            "learning_session_completed",
+            component: "learn",
+            operationID: session.id,
+            details: [
+                "outcome": .string(outcome.rawValue),
+                "summary": .string(summary),
+                "attempt_count": .integer(session.attempts.count),
+                "successful_attempt_count": .integer(
+                    session.successfulAttemptCount
+                ),
+                "consecutive_failure_count": .integer(
+                    session.consecutiveFailureCount
+                )
+            ]
         )
         return try learningStore.dashboard()
     }

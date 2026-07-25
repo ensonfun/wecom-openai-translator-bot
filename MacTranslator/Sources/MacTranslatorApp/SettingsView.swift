@@ -1,5 +1,7 @@
+import AppKit
 import MacTranslatorCore
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @AppStorage(AppSettings.modelKey) private var model = AppSettings.defaultModel
@@ -21,6 +23,7 @@ struct SettingsView: View {
 
     private let keychain = KeychainStore()
     private let learningEngine = LearningEngine()
+    private let diagnosticLogger = DiagnosticLogger.shared
 
     var body: some View {
         VStack(spacing: 0) {
@@ -44,6 +47,11 @@ struct SettingsView: View {
                     .tabItem {
                         Label("Learning", systemImage: "graduationcap")
                     }
+
+                diagnosticsSettings
+                    .tabItem {
+                        Label("Diagnostics", systemImage: "waveform.path.ecg")
+                    }
             }
 
             Divider()
@@ -66,6 +74,10 @@ struct SettingsView: View {
         }
         .frame(width: 720, height: 600)
         .onAppear {
+            diagnosticLogger.event(
+                "settings_opened",
+                component: "settings"
+            )
             loadSettings()
         }
         .confirmationDialog(
@@ -256,6 +268,48 @@ struct SettingsView: View {
         .padding(10)
     }
 
+    private var diagnosticsSettings: some View {
+        Form {
+            Section("Runtime Logs") {
+                Label(
+                    "Mac Translator continuously records app actions, chat and learning requests, model responses, storage operations, retries, and errors.",
+                    systemImage: "doc.text.magnifyingglass"
+                )
+
+                Text(
+                    "Conversation text and model output are included so a problem can be diagnosed without reproducing it. OpenAI API keys are always redacted."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                LabeledContent("Location") {
+                    Text(diagnosticLogger.logFileURL.path)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                        .lineLimit(2)
+                }
+            }
+
+            Section("Support") {
+                Button("Export Diagnostic Log…") {
+                    exportDiagnostics()
+                }
+
+                Button("Reveal Logs in Finder") {
+                    revealDiagnostics()
+                }
+
+                Text(
+                    "Logs rotate automatically and retain recent history, including detection of a previous unclean app exit."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .padding(10)
+    }
+
     private var selectedPromptBinding: Binding<String> {
         Binding(
             get: {
@@ -278,16 +332,36 @@ struct SettingsView: View {
     private func loadSettings() {
         do {
             apiKey = try keychain.read() ?? ""
+            if !apiKey.isEmpty {
+                diagnosticLogger.registerSecret(apiKey)
+            }
+            diagnosticLogger.event(
+                "settings_loaded",
+                component: "settings",
+                details: ["api_key_available": .boolean(!apiKey.isEmpty)]
+            )
         } catch let error as KeychainError where error.requiresLoginKeychainReconnect {
             apiKey = ""
             statusMessage = "The macOS login keychain needs to be reconnected."
             isError = true
             keychainReconnectShouldSave = false
             showingKeychainReconnect = true
+            diagnosticLogger.event(
+                "settings_keychain_reconnect_required",
+                level: .warning,
+                component: "settings",
+                failure: DiagnosticFailure.from(error)
+            )
         } catch {
             apiKey = ""
             statusMessage = error.localizedDescription
             isError = true
+            diagnosticLogger.event(
+                "settings_load_failed",
+                level: .error,
+                component: "settings",
+                failure: DiagnosticFailure.from(error)
+            )
         }
         globalShortcutEnabled = GlobalShortcutPreferences.isEnabled()
         globalShortcut = GlobalShortcutPreferences.load()
@@ -305,6 +379,11 @@ struct SettingsView: View {
         }
         statusMessage = "Default restored. Save to apply."
         isError = false
+        diagnosticLogger.event(
+            "prompt_default_restored",
+            component: "settings",
+            details: ["prompt_kind": .string(selectedPrompt.rawValue)]
+        )
     }
 
     private func save(offerKeychainReconnect: Bool = true) {
@@ -318,10 +397,22 @@ struct SettingsView: View {
         }) else {
             statusMessage = "Prompts cannot be empty."
             isError = true
+            diagnosticLogger.event(
+                "settings_save_blocked",
+                level: .warning,
+                component: "settings",
+                details: [
+                    "reason": .string("empty_prompt"),
+                    "translate_prompt": .string(prompts.translate),
+                    "correct_prompt": .string(prompts.correct),
+                    "slack_prompt": .string(prompts.slack)
+                ]
+            )
             return
         }
 
         do {
+            diagnosticLogger.registerSecret(apiKey)
             try keychain.save(apiKey)
             model = model.trimmingCharacters(in: .whitespacesAndNewlines)
             if model.isEmpty {
@@ -340,6 +431,25 @@ struct SettingsView: View {
             }
             statusMessage = "Saved"
             isError = false
+            diagnosticLogger.event(
+                "settings_saved",
+                component: "settings",
+                details: [
+                    "api_key_available": .boolean(!apiKey.isEmpty),
+                    "model": .string(model),
+                    "translate_prompt": .string(prompts.translate),
+                    "correct_prompt": .string(prompts.correct),
+                    "slack_prompt": .string(prompts.slack),
+                    "global_shortcut_enabled": .boolean(globalShortcutEnabled),
+                    "global_shortcut_key": .string(globalShortcut.keyName),
+                    "global_shortcut_key_code": .integer(
+                        Int(globalShortcut.keyCode)
+                    ),
+                    "global_shortcut_modifiers": .integer(
+                        globalShortcut.modifiers.rawValue
+                    )
+                ]
+            )
             NotificationCenter.default.post(name: .translatorCredentialsDidChange, object: nil)
         } catch let error as KeychainError
             where error.requiresLoginKeychainReconnect && offerKeychainReconnect {
@@ -347,13 +457,30 @@ struct SettingsView: View {
             isError = true
             keychainReconnectShouldSave = true
             showingKeychainReconnect = true
+            diagnosticLogger.event(
+                "settings_save_requires_keychain_reconnect",
+                level: .warning,
+                component: "settings",
+                failure: DiagnosticFailure.from(error)
+            )
         } catch {
             statusMessage = error.localizedDescription
             isError = true
+            diagnosticLogger.event(
+                "settings_save_failed",
+                level: .error,
+                component: "settings",
+                failure: DiagnosticFailure.from(error)
+            )
         }
     }
 
     private func reconnectKeychain() {
+        diagnosticLogger.event(
+            "keychain_reconnect_started",
+            component: "settings",
+            details: ["save_after_reconnect": .boolean(keychainReconnectShouldSave)]
+        )
         do {
             try keychain.reconnectDefaultKeychain()
             if keychainReconnectShouldSave {
@@ -367,36 +494,66 @@ struct SettingsView: View {
                     object: nil
                 )
             }
+            diagnosticLogger.event(
+                "keychain_reconnect_completed",
+                component: "settings",
+                details: [
+                    "save_after_reconnect": .boolean(
+                        keychainReconnectShouldSave
+                    )
+                ]
+            )
         } catch {
             statusMessage = error.localizedDescription
             isError = true
+            diagnosticLogger.event(
+                "keychain_reconnect_failed",
+                level: .error,
+                component: "settings",
+                failure: DiagnosticFailure.from(error)
+            )
         }
     }
 
     private func rebuildLearningProfile() {
-        manageLearningData(successMessage: "Learning profile rebuilt") {
+        manageLearningData(
+            actionName: "rebuild_learning_profile",
+            successMessage: "Learning profile rebuilt"
+        ) {
             _ = try await learningEngine.rebuildProfile()
         }
     }
 
     private func resetLearningProgress() {
-        manageLearningData(successMessage: "Learning progress reset") {
+        manageLearningData(
+            actionName: "reset_learning_progress",
+            successMessage: "Learning progress reset"
+        ) {
             _ = try await learningEngine.resetProgress()
         }
     }
 
     private func deleteLearningData() {
-        manageLearningData(successMessage: "Learning data deleted") {
+        manageLearningData(
+            actionName: "delete_learning_data",
+            successMessage: "Learning data deleted"
+        ) {
             _ = try await learningEngine.deleteAllLearningData()
         }
     }
 
     private func manageLearningData(
+        actionName: String,
         successMessage: String,
         action: @escaping @Sendable () async throws -> Void
     ) {
         guard !isManagingLearningData else { return }
         isManagingLearningData = true
+        diagnosticLogger.event(
+            "settings_learning_action_started",
+            component: "settings",
+            details: ["action": .string(actionName)]
+        )
         Task {
             do {
                 try await action()
@@ -406,11 +563,89 @@ struct SettingsView: View {
                     name: .translatorLearningDataDidChange,
                     object: nil
                 )
+                diagnosticLogger.event(
+                    "settings_learning_action_completed",
+                    component: "settings",
+                    details: ["action": .string(actionName)]
+                )
             } catch {
                 statusMessage = error.localizedDescription
                 isError = true
+                diagnosticLogger.event(
+                    "settings_learning_action_failed",
+                    level: .error,
+                    component: "settings",
+                    failure: DiagnosticFailure.from(error),
+                    details: ["action": .string(actionName)]
+                )
             }
             isManagingLearningData = false
+        }
+    }
+
+    private func revealDiagnostics() {
+        diagnosticLogger.event(
+            "diagnostics_reveal_requested",
+            component: "settings"
+        )
+        diagnosticLogger.flush()
+        if FileManager.default.fileExists(
+            atPath: diagnosticLogger.logFileURL.path
+        ) {
+            NSWorkspace.shared.activateFileViewerSelecting([
+                diagnosticLogger.logFileURL
+            ])
+        } else {
+            NSWorkspace.shared.open(diagnosticLogger.logsDirectoryURL)
+        }
+    }
+
+    private func exportDiagnostics() {
+        diagnosticLogger.event(
+            "diagnostics_export_requested",
+            component: "settings"
+        )
+        diagnosticLogger.flush()
+
+        let panel = NSSavePanel()
+        panel.title = "Export Diagnostic Log"
+        panel.prompt = "Export"
+        panel.allowedContentTypes = [
+            UTType(filenameExtension: "jsonl") ?? .plainText
+        ]
+        panel.canCreateDirectories = true
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
+        panel.nameFieldStringValue =
+            "MacTranslator-Diagnostics-\(formatter.string(from: Date())).jsonl"
+
+        guard panel.runModal() == .OK, let destinationURL = panel.url else {
+            diagnosticLogger.event(
+                "diagnostics_export_cancelled",
+                component: "settings"
+            )
+            return
+        }
+
+        do {
+            try diagnosticLogger.exportArchive(to: destinationURL)
+            statusMessage = "Diagnostic log exported"
+            isError = false
+            diagnosticLogger.event(
+                "diagnostics_export_completed",
+                component: "settings",
+                details: ["destination": .string(destinationURL.path)]
+            )
+        } catch {
+            statusMessage = error.localizedDescription
+            isError = true
+            diagnosticLogger.event(
+                "diagnostics_export_failed",
+                level: .error,
+                component: "settings",
+                failure: DiagnosticFailure.from(error),
+                details: ["destination": .string(destinationURL.path)]
+            )
         }
     }
 }

@@ -42,6 +42,8 @@ API Key 在 App 设置中填写并保存在 macOS Keychain。完整说明见 [`M
 
 学习事件、知识点投影、复习计划和 session 也保存在同一个 SQLite 数据库中。清空聊天不会自动删除已经提炼的学习画像；学习数据可以在 Settings → Learning 中单独重置、重建或永久删除。
 
+App 会持续写入可轮转的 JSON Lines 运行日志，记录 Chat、Learn、OpenAI、SQLite、Keychain 和启动/退出的完整诊断链路。除 OpenAI API Key 始终脱敏外，日志会保留问题现场所需的输入与输出。可以在 Settings → Diagnostics 中查看位置或一键导出。
+
 ## 旧企业微信实现
 
 原 Python/企业微信长连接代码暂时保留在 `wecom_translator/`、`app.py` 和 `tests/` 中，方便核对旧行为或后续迁移；新的 macOS App 不引用这些代码，也不需要 WeCom Bot ID、Secret、WebSocket 或 Python 运行环境。
