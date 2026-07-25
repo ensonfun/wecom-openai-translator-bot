@@ -62,6 +62,7 @@ public struct OpenAIClient: Sendable {
                                 model: model,
                                 instructions: instructions,
                                 input: input,
+                                store: false,
                                 stream: true
                             )
                         )
@@ -166,6 +167,147 @@ public struct OpenAIClient: Sendable {
         }
     }
 
+    public func structuredResponse<Output: Decodable & Sendable>(
+        apiKey: String,
+        model: String,
+        instructions: String,
+        input: String,
+        schemaName: String,
+        schema: JSONValue,
+        maxOutputTokens: Int = 2_000,
+        outputType: Output.Type = Output.self
+    ) async throws -> Output {
+        let data = try await structuredResponseData(
+            apiKey: apiKey,
+            model: model,
+            instructions: instructions,
+            input: input,
+            schemaName: schemaName,
+            schema: schema,
+            maxOutputTokens: maxOutputTokens
+        )
+        do {
+            return try JSONDecoder().decode(Output.self, from: data)
+        } catch {
+            throw OpenAIClientError.stream("The structured response did not match the app's data model.")
+        }
+    }
+
+    private func structuredResponseData(
+        apiKey: String,
+        model: String,
+        instructions: String,
+        input: String,
+        schemaName: String,
+        schema: JSONValue,
+        maxOutputTokens: Int
+    ) async throws -> Data {
+        let requestID = UUID()
+        let startedAt = Date()
+        var attempt = 0
+
+        while true {
+            attempt += 1
+            diagnosticLogger.requestStarted(requestID: requestID, attempt: attempt)
+            do {
+                var request = URLRequest(url: endpoint)
+                request.httpMethod = "POST"
+                request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.httpBody = try JSONEncoder().encode(
+                    StructuredResponseRequest(
+                        model: model,
+                        instructions: instructions,
+                        input: input,
+                        store: false,
+                        maxOutputTokens: maxOutputTokens,
+                        text: StructuredTextConfiguration(
+                            format: StructuredTextFormat(
+                                type: "json_schema",
+                                name: schemaName,
+                                strict: true,
+                                schema: schema
+                            )
+                        )
+                    )
+                )
+
+                let (data, response) = try await session.data(for: request)
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw OpenAIClientError.invalidResponse
+                }
+                diagnosticLogger.responseReceived(
+                    requestID: requestID,
+                    attempt: attempt,
+                    statusCode: httpResponse.statusCode,
+                    openAIRequestID: httpResponse.value(forHTTPHeaderField: "x-request-id")
+                )
+                guard (200..<300).contains(httpResponse.statusCode) else {
+                    let envelope = try? JSONDecoder().decode(APIErrorEnvelope.self, from: data)
+                    let fallback = String(data: data, encoding: .utf8) ?? "Unknown error"
+                    throw OpenAIClientError.api(
+                        statusCode: httpResponse.statusCode,
+                        message: envelope?.error.message ?? fallback
+                    )
+                }
+
+                let envelope = try JSONDecoder().decode(StructuredResponseEnvelope.self, from: data)
+                if let error = envelope.error {
+                    throw OpenAIClientError.stream(error.message)
+                }
+                for output in envelope.output {
+                    guard output.type == "message" else { continue }
+                    for content in output.content {
+                        if content.type == "refusal", let refusal = content.refusal {
+                            throw OpenAIClientError.stream(refusal)
+                        }
+                        if content.type == "output_text", let text = content.text,
+                           let outputData = text.data(using: .utf8) {
+                            diagnosticLogger.requestCompleted(
+                                requestID: requestID,
+                                attempt: attempt,
+                                receivedText: true,
+                                durationMilliseconds: Self.elapsedMilliseconds(since: startedAt)
+                            )
+                            return outputData
+                        }
+                    }
+                }
+                if envelope.status == "incomplete" {
+                    throw OpenAIClientError.stream(
+                        envelope.incompleteDetails?.reason
+                            ?? "The structured response was incomplete."
+                    )
+                }
+                throw OpenAIClientError.invalidResponse
+            } catch {
+                let failure = Self.diagnosticFailure(for: error)
+                let retryIndex = attempt - 1
+                if Self.isRetryable(error),
+                   retryIndex < retryDelayNanoseconds.count,
+                   !Task.isCancelled {
+                    let delay = retryDelayNanoseconds[retryIndex]
+                    diagnosticLogger.retryScheduled(
+                        requestID: requestID,
+                        attempt: attempt,
+                        delayMilliseconds: Int(delay / 1_000_000),
+                        failure: failure
+                    )
+                    try await Task.sleep(nanoseconds: delay)
+                    continue
+                }
+                diagnosticLogger.requestFailed(
+                    requestID: requestID,
+                    attempt: attempt,
+                    receivedText: false,
+                    durationMilliseconds: Self.elapsedMilliseconds(since: startedAt),
+                    failure: failure
+                )
+                throw error
+            }
+        }
+    }
+
     public static func isRetryable(_ error: Error) -> Bool {
         if let urlError = error as? URLError {
             return [
@@ -239,7 +381,66 @@ private struct ResponseRequest: Encodable {
     let model: String
     let instructions: String
     let input: String
+    let store: Bool
     let stream: Bool
+}
+
+private struct StructuredResponseRequest: Encodable {
+    let model: String
+    let instructions: String
+    let input: String
+    let store: Bool
+    let maxOutputTokens: Int
+    let text: StructuredTextConfiguration
+
+    enum CodingKeys: String, CodingKey {
+        case model
+        case instructions
+        case input
+        case store
+        case maxOutputTokens = "max_output_tokens"
+        case text
+    }
+}
+
+private struct StructuredTextConfiguration: Encodable {
+    let format: StructuredTextFormat
+}
+
+private struct StructuredTextFormat: Encodable {
+    let type: String
+    let name: String
+    let strict: Bool
+    let schema: JSONValue
+}
+
+private struct StructuredResponseEnvelope: Decodable {
+    let status: String?
+    let error: APIErrorDetail?
+    let incompleteDetails: StructuredIncompleteDetails?
+    let output: [StructuredOutputItem]
+
+    enum CodingKeys: String, CodingKey {
+        case status
+        case error
+        case incompleteDetails = "incomplete_details"
+        case output
+    }
+}
+
+private struct StructuredIncompleteDetails: Decodable {
+    let reason: String?
+}
+
+private struct StructuredOutputItem: Decodable {
+    let type: String
+    let content: [StructuredOutputContent]
+}
+
+private struct StructuredOutputContent: Decodable {
+    let type: String
+    let text: String?
+    let refusal: String?
 }
 
 private struct StreamEvent: Decodable {

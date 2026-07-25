@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import MacTranslatorCore
+import Security
 
 var failures = 0
 
@@ -18,16 +19,19 @@ final class OpenAIStubURLProtocol: URLProtocol {
         case connectionLostBeforeText
         case success(String)
         case partialTextThenConnectionLost(String)
+        case structuredSuccess(String)
     }
 
     private static let lock = NSLock()
     private static var outcomes: [Outcome] = []
     private static var requests = 0
+    private static var requestBodies: [Data] = []
 
     static func configure(_ newOutcomes: [Outcome]) {
         lock.lock()
         outcomes = newOutcomes
         requests = 0
+        requestBodies = []
         lock.unlock()
     }
 
@@ -35,6 +39,12 @@ final class OpenAIStubURLProtocol: URLProtocol {
         lock.lock()
         defer { lock.unlock() }
         return requests
+    }
+
+    static var lastRequestBody: Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        return requestBodies.last
     }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -45,6 +55,9 @@ final class OpenAIStubURLProtocol: URLProtocol {
         let outcome: Outcome
         Self.lock.lock()
         Self.requests += 1
+        if let body = request.httpBody ?? Self.readBodyStream(request.httpBodyStream) {
+            Self.requestBodies.append(body)
+        }
         if Self.outcomes.isEmpty {
             outcome = .connectionLostBeforeText
         } else {
@@ -62,6 +75,8 @@ final class OpenAIStubURLProtocol: URLProtocol {
             DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) { [self] in
                 client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
             }
+        case .structuredSuccess(let json):
+            sendJSONResponse(outputText: json)
         }
     }
 
@@ -89,6 +104,81 @@ final class OpenAIStubURLProtocol: URLProtocol {
         let jsonString = String(decoding: encodedText, as: UTF8.self)
         let done = includeDone ? "data: [DONE]\n\n" : ""
         return Data("data: {\"type\":\"response.output_text.delta\",\"delta\":\(jsonString)}\n\n\(done)".utf8)
+    }
+
+    private static func readBodyStream(_ stream: InputStream?) -> Data? {
+        guard let stream else { return nil }
+        stream.open()
+        defer { stream.close() }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 4_096)
+        while stream.hasBytesAvailable {
+            let count = stream.read(&buffer, maxLength: buffer.count)
+            if count <= 0 { break }
+            data.append(buffer, count: count)
+        }
+        return data.isEmpty ? nil : data
+    }
+
+    private func sendJSONResponse(outputText: String) {
+        let encodedText = try! JSONEncoder().encode(outputText)
+        let text = String(decoding: encodedText, as: UTF8.self)
+        let body = Data(
+            """
+            {
+              "status": "completed",
+              "error": null,
+              "incomplete_details": null,
+              "output": [{
+                "type": "message",
+                "content": [{
+                  "type": "output_text",
+                  "text": \(text)
+                }]
+              }]
+            }
+            """.utf8
+        )
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: [
+                "Content-Type": "application/json",
+                "x-request-id": "req_structured_self_test"
+            ]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+}
+
+private struct StructuredSelfTestOutput: Decodable {
+    let value: String
+}
+
+if let optionIndex = CommandLine.arguments.firstIndex(of: "--database-directory"),
+   CommandLine.arguments.indices.contains(optionIndex + 1) {
+    let directoryURL = URL(
+        fileURLWithPath: CommandLine.arguments[optionIndex + 1],
+        isDirectory: true
+    )
+    do {
+        let history = ChatHistoryStore(directoryURL: directoryURL)
+        let messages = try history.load()
+        let turns = try history.learningSourceTurns()
+        let dashboard = try LearningStore(directoryURL: directoryURL).dashboard()
+        print(
+            "Migration validation passed: "
+                + "\(messages.count) messages, "
+                + "\(turns.count) t/s turns, "
+                + "\(dashboard.knowledgePoints.count) learning projections."
+        )
+        exit(0)
+    } catch {
+        print("Migration validation failed: \(error.localizedDescription)")
+        exit(1)
     }
 }
 
@@ -212,6 +302,14 @@ expect(
     AppSettings.resolvedModel("gpt-5.4-mini") == "gpt-5.4-mini",
     "其他自定义模型设置保持不变"
 )
+expect(
+    KeychainError.from(status: errSecAuthFailed).requiresLoginKeychainReconnect,
+    "Keychain 鉴权失败会进入重新连接流程"
+)
+expect(
+    !KeychainError.from(status: errSecParam).requiresLoginKeychainReconnect,
+    "普通 Keychain 参数错误不会误触发重新连接"
+)
 
 let multilineMarkdown = "**Option 1:**\nFirst line\n**Option 2:**\nSecond line"
 let formattedMarkdown = MessageTextFormatter.format(multilineMarkdown)
@@ -226,6 +324,41 @@ expect(
     String(formattedBlockMarkdown.characters) == "Feedback & Corrections\nCritique:\n- First item",
     "Markdown 标题会移除井号并保留块之间的换行"
 )
+
+do {
+    let analysisTurnID = UUID()
+    let analysisJSON = Data(
+        """
+        {
+          "turns": [{
+            "turn_id": "\(analysisTurnID.uuidString)",
+            "input_language": "english",
+            "is_proficiency_evidence": true,
+            "evidence": [{
+              "kind": "error",
+              "knowledge_point_id": "grammar.tense_aspect",
+              "title": "Tense and aspect",
+              "dimension": "grammar",
+              "severity": "high",
+              "confidence": 0.98,
+              "communication_impact": 0.9,
+              "source_excerpt": "He go yesterday.",
+              "corrected_form": "He went yesterday.",
+              "explanation_zh": "需要使用过去时。"
+            }]
+          }]
+        }
+        """.utf8
+    )
+    let analysis = try JSONDecoder().decode(HistoryAnalysisResult.self, from: analysisJSON)
+    expect(
+        analysis.turns.first?.evidence.first?.knowledgePointID == "grammar.tense_aspect",
+        "历史分析 JSON Schema 字段可以解码到学习模型"
+    )
+} catch {
+    failures += 1
+    print("✗ 历史分析结构解码自检出错：\(error.localizedDescription)")
+}
 
 let testDirectory = FileManager.default.temporaryDirectory
     .appendingPathComponent("MacTranslatorSelfTests-\(UUID().uuidString)", isDirectory: true)
@@ -243,7 +376,12 @@ do {
     try legacyData.write(to: historyStore.legacyJSONURL)
 
     let restoredMessages = try historyStore.load()
-    expect(restoredMessages == savedMessages, "旧 JSON 聊天记录会迁移到 SQLite")
+    expect(
+        restoredMessages.map(\.id) == savedMessages.map(\.id)
+            && restoredMessages.map(\.text) == savedMessages.map(\.text)
+            && restoredMessages.map(\.mode) == savedMessages.map(\.mode),
+        "旧 JSON 聊天记录会迁移到 SQLite"
+    )
     expect(FileManager.default.fileExists(atPath: historyStore.databaseURL.path), "SQLite 数据库已创建")
     expect(!FileManager.default.fileExists(atPath: historyStore.legacyJSONURL.path), "迁移成功后删除旧 JSON")
 
@@ -257,20 +395,271 @@ do {
     let messagesAfterInsert = try historyStore.load()
     expect(messagesAfterInsert.count == 3, "可以增量插入单条消息")
 
+    let turnID = UUID()
+    let turnDate = Date(timeIntervalSince1970: 1_725_000_000)
+    let learningUser = ChatMessage(
+        role: .user,
+        text: "He go to office yesterday.",
+        mode: .correct,
+        turnID: turnID,
+        createdAt: turnDate
+    )
+    let learningAssistant = ChatMessage(
+        role: .assistant,
+        text: "He went to the office yesterday.",
+        mode: .correct,
+        turnID: turnID,
+        createdAt: turnDate
+    )
+    try historyStore.upsert(learningUser, position: 3)
+    try historyStore.upsert(learningAssistant, position: 4)
+    try historyStore.upsertTurn(
+        ChatTurn(
+            id: turnID,
+            mode: .correct,
+            userMessageID: learningUser.id,
+            assistantMessageID: learningAssistant.id,
+            createdAt: turnDate,
+            completedAt: turnDate,
+            status: .completed,
+            model: "self-test-model",
+            promptFingerprint: PromptFingerprint.make("test prompt")
+        )
+    )
+    let learningTurns = try historyStore.learningSourceTurns()
+    expect(
+        learningTurns.contains {
+            $0.id == turnID
+                && $0.userText == learningUser.text
+                && $0.assistantText == learningAssistant.text
+        },
+        "t/s 消息会按稳定 turn ID 组成学习数据源"
+    )
+
     let exportURL = testDirectory.appendingPathComponent("export.json")
     try historyStore.exportJSON(to: exportURL)
     let exportedMessages = try JSONDecoder().decode(
         [ChatMessage].self,
         from: Data(contentsOf: exportURL)
     )
-    expect(exportedMessages.count == 3, "聊天记录可以导出为 JSON")
+    expect(exportedMessages.count == 5, "聊天记录可以导出为 JSON")
 
     try historyStore.clear()
     let clearedMessages = try historyStore.load()
     expect(clearedMessages.isEmpty, "清空按钮会删除 SQLite 中的聊天记录")
+    let clearedLearningTurns = try historyStore.learningSourceTurns()
+    expect(clearedLearningTurns.isEmpty, "清空聊天也会删除 chat turn 元数据")
 } catch {
     failures += 1
     print("✗ 聊天记录持久化自检出错：\(error.localizedDescription)")
+}
+
+let learningTestDirectory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("MacTranslatorLearningTests-\(UUID().uuidString)", isDirectory: true)
+defer { try? FileManager.default.removeItem(at: learningTestDirectory) }
+let learningStore = LearningStore(directoryURL: learningTestDirectory)
+
+do {
+    let sourceTurnID = UUID()
+    let observedAt = Date(timeIntervalSince1970: 1_725_000_100)
+    let evidencePayload = EvidenceObservedPayload(
+        evidenceID: UUID(),
+        sourceTurnID: sourceTurnID,
+        sourceMode: .correct,
+        sourceOrigin: .native,
+        inputLanguage: .english,
+        isProficiencyEvidence: true,
+        knowledgePointID: "grammar.tense_aspect",
+        title: "Tense and aspect",
+        dimension: .grammar,
+        severity: .high,
+        confidence: 0.98,
+        communicationImpact: 0.9,
+        sourceExcerpt: "He go yesterday.",
+        correctedForm: "He went yesterday.",
+        explanationZH: "过去发生的动作需要使用一般过去时。"
+    )
+    let evidenceEvent = try PendingLearningEvent(
+        id: UUID(),
+        type: .errorEvidenceObserved,
+        occurredAt: observedAt,
+        knowledgePointID: "grammar.tense_aspect",
+        sourceTurnID: sourceTurnID,
+        idempotencyKey: "self-test-evidence",
+        producer: "self_test",
+        payload: evidencePayload
+    )
+    let firstEvidenceInsert = try learningStore.append(evidenceEvent)
+    let duplicateEvidenceInsert = try learningStore.append(evidenceEvent)
+    expect(firstEvidenceInsert, "学习事件可以追加到事件存储")
+    expect(!duplicateEvidenceInsert, "相同幂等键不会重复写入学习事件")
+
+    let completionPayload = SourceTurnAnalysisCompletedPayload(
+        sourceTurnID: sourceTurnID,
+        inputLanguage: .english,
+        isProficiencyEvidence: true,
+        analyzerVersion: LearningPromptContracts.analyzerVersion,
+        evidenceCount: 1
+    )
+    try learningStore.append(
+        PendingLearningEvent(
+            type: .sourceTurnAnalysisCompleted,
+            occurredAt: observedAt,
+            sourceTurnID: sourceTurnID,
+            idempotencyKey: "self-test-analysis-complete",
+            producer: "self_test",
+            payload: completionPayload
+        )
+    )
+
+    var learningDashboard = try learningStore.dashboard()
+    let initialTense = learningDashboard.knowledgePoints.first {
+        $0.id == "grammar.tense_aspect"
+    }
+    expect(initialTense != nil, "错误证据会建立知识点投影")
+    expect((initialTense?.mastery ?? 1) < 0.5, "真实聊天错误会降低初始掌握度")
+    expect(learningDashboard.analyzedTurnCount == 1, "分析覆盖投影会记录已处理聊天")
+    let analyzedTurnIDs = try learningStore.analyzedTurnIDs(
+        analyzerVersion: LearningPromptContracts.analyzerVersion
+    )
+    expect(
+        analyzedTurnIDs.contains(sourceTurnID),
+        "增量同步可以查询已分析的 turn ID"
+    )
+
+    let sessionID = UUID()
+    let questionID = UUID()
+    let answerID = UUID()
+    let generatedQuestion = GeneratedLearningQuestion(
+        type: .sentenceRepair,
+        prompt: "Fix: She go home yesterday.",
+        context: "A short workplace update",
+        hint: "Look at the time word.",
+        rubric: "Use the past tense of go.",
+        referenceAnswer: "She went home yesterday."
+    )
+    let question = QuestionPresentedPayload(
+        id: questionID,
+        sessionID: sessionID,
+        ordinal: 1,
+        knowledgePointID: "grammar.tense_aspect",
+        generated: generatedQuestion
+    )
+    let answer = AnswerSubmittedPayload(
+        answerID: answerID,
+        sessionID: sessionID,
+        questionID: questionID,
+        answer: "She went home yesterday.",
+        submittedAt: observedAt.addingTimeInterval(20)
+    )
+    let grade = AnswerGradedPayload(
+        gradeID: UUID(),
+        sessionID: sessionID,
+        questionID: questionID,
+        answerID: answerID,
+        knowledgePointID: "grammar.tense_aspect",
+        questionType: .sentenceRepair,
+        usedHint: false,
+        isRetry: false,
+        verdict: .correct,
+        confidence: 0.99,
+        targetDemonstrated: true,
+        correctedAnswer: "She went home yesterday.",
+        explanationZH: "went 正确表达过去发生的动作。",
+        issues: [],
+        followUp: .variation,
+        gradedAt: observedAt.addingTimeInterval(30)
+    )
+    try learningStore.append([
+        try PendingLearningEvent(
+            type: .learningSessionStarted,
+            occurredAt: observedAt.addingTimeInterval(10),
+            sessionID: sessionID,
+            idempotencyKey: "self-test-session-start",
+            producer: "self_test",
+            payload: LearningSessionStartedPayload(
+                sessionID: sessionID,
+                startedAt: observedAt.addingTimeInterval(10)
+            )
+        ),
+        try PendingLearningEvent(
+            type: .sessionFocusSelected,
+            occurredAt: observedAt.addingTimeInterval(11),
+            sessionID: sessionID,
+            knowledgePointID: "grammar.tense_aspect",
+            idempotencyKey: "self-test-session-focus",
+            producer: "self_test",
+            payload: SessionFocusSelectedPayload(
+                sessionID: sessionID,
+                knowledgePointID: "grammar.tense_aspect",
+                title: "Tense and aspect",
+                reason: "Seen in a real t message."
+            )
+        ),
+        try PendingLearningEvent(
+            type: .questionPresented,
+            occurredAt: observedAt.addingTimeInterval(12),
+            sessionID: sessionID,
+            knowledgePointID: "grammar.tense_aspect",
+            idempotencyKey: "self-test-question",
+            producer: "self_test",
+            payload: question
+        ),
+        try PendingLearningEvent(
+            type: .answerSubmitted,
+            occurredAt: observedAt.addingTimeInterval(20),
+            sessionID: sessionID,
+            knowledgePointID: "grammar.tense_aspect",
+            idempotencyKey: "self-test-answer",
+            producer: "self_test",
+            payload: answer
+        ),
+        try PendingLearningEvent(
+            type: .answerGraded,
+            occurredAt: observedAt.addingTimeInterval(30),
+            sessionID: sessionID,
+            knowledgePointID: "grammar.tense_aspect",
+            idempotencyKey: "self-test-grade",
+            producer: "self_test",
+            payload: grade
+        )
+    ])
+
+    learningDashboard = try learningStore.dashboard()
+    expect(
+        learningDashboard.activeSession?.attempts.last?.grade?.verdict == .correct,
+        "答案、判题和讲解状态可以从事件重建"
+    )
+    expect(
+        learningDashboard.knowledgePoints.first {
+            $0.id == "grammar.tense_aspect"
+        }?.successfulAttempts == 1,
+        "正确答案会通过确定性策略更新知识点投影"
+    )
+
+    let beforeReplay = learningDashboard
+    try learningStore.rebuildProjections()
+    let replayedDashboard = try learningStore.dashboard()
+    expect(replayedDashboard == beforeReplay, "完整事件重放会得到相同学习投影")
+
+    try learningStore.startNewEpoch(keepExtractedEvidence: true)
+    let resetDashboard = try learningStore.dashboard()
+    expect(resetDashboard.activeSession == nil, "重置进度会结束当前学习 session")
+    expect(
+        resetDashboard.knowledgePoints.first {
+            $0.id == "grammar.tense_aspect"
+        }?.realChatErrorCount == 1,
+        "重置进度会保留从聊天提取的弱项证据"
+    )
+
+    try learningStore.deleteAllLearningData()
+    let deletedEvents = try learningStore.loadEvents()
+    let deletedDashboard = try learningStore.dashboard()
+    expect(deletedEvents.isEmpty, "可以永久删除完整学习事件历史")
+    expect(deletedDashboard.knowledgePoints.isEmpty, "删除学习数据会清空投影")
+} catch {
+    failures += 1
+    print("✗ 事件驱动学习存储自检出错：\(error.localizedDescription)")
 }
 
 expect(
@@ -310,6 +699,34 @@ let retryClient = OpenAIClient(
 )
 let secretAPIKey = "sk-self-test-must-not-appear"
 let secretChatText = "private chat body must not appear"
+
+do {
+    OpenAIStubURLProtocol.configure([
+        .structuredSuccess(#"{"value":"schema matched"}"#)
+    ])
+    let structured: StructuredSelfTestOutput = try await retryClient.structuredResponse(
+        apiKey: secretAPIKey,
+        model: "self-test-model",
+        instructions: "Return structured JSON.",
+        input: secretChatText,
+        schemaName: "self_test",
+        schema: .strictObject(properties: [
+            "value": .object(["type": .string("string")])
+        ])
+    )
+    expect(structured.value == "schema matched", "Responses API 结构化输出可以解码为 Swift 类型")
+
+    let requestObject = OpenAIStubURLProtocol.lastRequestBody.flatMap {
+        try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+    }
+    let textObject = requestObject?["text"] as? [String: Any]
+    let formatObject = textObject?["format"] as? [String: Any]
+    expect(formatObject?["type"] as? String == "json_schema", "结构化请求使用 text.format JSON Schema")
+    expect(requestObject?["store"] as? Bool == false, "学习请求明确关闭服务端响应存储")
+} catch {
+    failures += 1
+    print("✗ 结构化输出自检出错：\(error.localizedDescription)")
+}
 
 do {
     OpenAIStubURLProtocol.configure([
@@ -410,17 +827,26 @@ expect(
 
 if CommandLine.arguments.contains("--live-openai") {
     do {
-        guard let apiKey = try KeychainStore().read(), !apiKey.isEmpty else {
+        func liveStage(_ message: String) {
+            FileHandle.standardError.write(Data("[live] \(message)\n".utf8))
+        }
+        liveStage("reading API key")
+        guard let apiKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"],
+              !apiKey.isEmpty else {
             throw NSError(
                 domain: "MacTranslatorSelfTests",
                 code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "OpenAI API key is missing from Keychain."]
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Set OPENAI_API_KEY in the shell before running live self-tests."
+                ]
             )
         }
         let appDefaults = UserDefaults(suiteName: "com.mario.MacTranslator")
         let model = AppSettings.resolvedModel(
             appDefaults?.string(forKey: AppSettings.modelKey)
         )
+        liveStage("streaming request with \(model)")
         var output = ""
         for try await delta in OpenAIClient().streamResponse(
             apiKey: apiKey,
@@ -431,6 +857,70 @@ if CommandLine.arguments.contains("--live-openai") {
             output += delta
         }
         expect(!output.isEmpty, "真实 OpenAI 流式请求成功（model: \(model)）")
+
+        liveStage("structured request")
+        let liveStructured: StructuredSelfTestOutput = try await OpenAIClient().structuredResponse(
+            apiKey: apiKey,
+            model: model,
+            instructions: "Return the requested value as structured JSON.",
+            input: "Set value to live.",
+            schemaName: "live_self_test",
+            schema: .strictObject(properties: [
+                "value": .object(["type": .string("string")])
+            ])
+        )
+        expect(!liveStructured.value.isEmpty, "真实 OpenAI 结构化输出请求成功")
+
+        liveStage("learning analysis")
+        let liveLearningDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MacTranslatorLiveLearning-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: liveLearningDirectory) }
+        let liveHistoryStore = ChatHistoryStore(directoryURL: liveLearningDirectory)
+        let liveLearningStore = LearningStore(directoryURL: liveLearningDirectory)
+        let liveTurnID = UUID()
+        let liveUserMessage = ChatMessage(
+            role: .user,
+            text: "He go to the office yesterday.",
+            mode: .correct,
+            turnID: liveTurnID
+        )
+        let liveAssistantMessage = ChatMessage(
+            role: .assistant,
+            text: "He went to the office yesterday.",
+            mode: .correct,
+            turnID: liveTurnID
+        )
+        try liveHistoryStore.upsert(liveUserMessage, position: 0)
+        try liveHistoryStore.upsert(liveAssistantMessage, position: 1)
+        let liveEngine = LearningEngine(
+            historyStore: liveHistoryStore,
+            learningStore: liveLearningStore
+        )
+        let liveSync = try await liveEngine.syncHistory(apiKey: apiKey, model: model)
+        expect(
+            liveSync.analyzedTurnCount == 1 && liveSync.evidenceCount > 0,
+            "真实模型可以从 t 记录提取学习证据"
+        )
+        liveStage("question generation")
+        var liveDashboard = try await liveEngine.startOrResumeSession(
+            apiKey: apiKey,
+            model: model
+        )
+        let liveQuestion = liveDashboard.activeSession?.attempts.last?.question
+        expect(liveQuestion != nil, "真实模型可以针对弱项生成题目")
+        if let liveQuestion {
+            liveStage("answer grading")
+            liveDashboard = try await liveEngine.submitAnswer(
+                liveQuestion.referenceAnswer,
+                apiKey: apiKey,
+                model: model
+            )
+            expect(
+                liveDashboard.activeSession?.attempts.last?.grade != nil,
+                "真实模型可以判题并生成中文讲解"
+            )
+        }
+        liveStage("complete")
     } catch {
         failures += 1
         print("✗ 真实 OpenAI 流式请求失败：\(error.localizedDescription)")

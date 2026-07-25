@@ -13,8 +13,14 @@ struct SettingsView: View {
     @State private var slackPrompt = TranslationPrompts.slack
     @State private var statusMessage: String?
     @State private var isError = false
+    @State private var showingResetLearningConfirmation = false
+    @State private var showingDeleteLearningConfirmation = false
+    @State private var showingKeychainReconnect = false
+    @State private var keychainReconnectShouldSave = false
+    @State private var isManagingLearningData = false
 
     private let keychain = KeychainStore()
+    private let learningEngine = LearningEngine()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -32,6 +38,11 @@ struct SettingsView: View {
                 promptSettings
                     .tabItem {
                         Label("Prompts", systemImage: "text.quote")
+                    }
+
+                learningSettings
+                    .tabItem {
+                        Label("Learning", systemImage: "graduationcap")
                     }
             }
 
@@ -56,6 +67,43 @@ struct SettingsView: View {
         .frame(width: 720, height: 600)
         .onAppear {
             loadSettings()
+        }
+        .confirmationDialog(
+            "Reset learning progress?",
+            isPresented: $showingResetLearningConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Reset Progress", role: .destructive) {
+                resetLearningProgress()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Extracted weaknesses stay available, but practice attempts and mastery progress start again.")
+        }
+        .confirmationDialog(
+            "Delete all learning data?",
+            isPresented: $showingDeleteLearningConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Delete Learning Data", role: .destructive) {
+                deleteLearningData()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This permanently removes the learning event history, progress, and derived examples. Chat history is not deleted.")
+        }
+        .alert(
+            "Reconnect macOS login keychain?",
+            isPresented: $showingKeychainReconnect
+        ) {
+            Button(keychainReconnectShouldSave ? "Reconnect and Save" : "Reconnect") {
+                reconnectKeychain()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "macOS rejected access to the login keychain. Reconnecting briefly locks and unlocks it, then macOS asks for your Mac login password. Mac Translator never receives that password."
+            )
         }
     }
 
@@ -112,7 +160,9 @@ struct SettingsView: View {
                 TextField("Model", text: $model)
                     .textFieldStyle(.roundedBorder)
 
-                Text("Your API key is stored only in macOS Keychain. The default model is \(AppSettings.defaultModel).")
+                Text(
+                    "Chat and Learn share this API key and model. The key is stored only in macOS Keychain. The default model is \(AppSettings.defaultModel)."
+                )
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -156,13 +206,54 @@ struct SettingsView: View {
                 }
 
             Label(
-                "Each request sends only the current message with the selected prompt. Chat history is never included.",
+                "Chat requests send only the current message. Learn separately analyzes new t/s records in small incremental batches.",
                 systemImage: "lock.shield"
             )
             .font(.caption)
             .foregroundStyle(.secondary)
         }
         .padding(20)
+    }
+
+    private var learningSettings: some View {
+        Form {
+            Section("Personal English Teacher") {
+                Label(
+                    "Learning events and progress are stored locally in the same SQLite database as chat history.",
+                    systemImage: "externaldrive.fill"
+                )
+                Text(
+                    "The Learn page sends only new t/s turns and the current exercise context to OpenAI. It never sends the complete event archive."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            Section("Maintenance") {
+                Button("Rebuild Learning Profile") {
+                    rebuildLearningProfile()
+                }
+                .disabled(isManagingLearningData)
+
+                Text("Recreates the current profile from the immutable learning event history.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Reset") {
+                Button("Reset Learning Progress…") {
+                    showingResetLearningConfirmation = true
+                }
+                .disabled(isManagingLearningData)
+
+                Button("Delete All Learning Data…", role: .destructive) {
+                    showingDeleteLearningConfirmation = true
+                }
+                .disabled(isManagingLearningData)
+            }
+        }
+        .formStyle(.grouped)
+        .padding(10)
     }
 
     private var selectedPromptBinding: Binding<String> {
@@ -185,7 +276,19 @@ struct SettingsView: View {
     }
 
     private func loadSettings() {
-        apiKey = (try? keychain.read()) ?? ""
+        do {
+            apiKey = try keychain.read() ?? ""
+        } catch let error as KeychainError where error.requiresLoginKeychainReconnect {
+            apiKey = ""
+            statusMessage = "The macOS login keychain needs to be reconnected."
+            isError = true
+            keychainReconnectShouldSave = false
+            showingKeychainReconnect = true
+        } catch {
+            apiKey = ""
+            statusMessage = error.localizedDescription
+            isError = true
+        }
         globalShortcutEnabled = GlobalShortcutPreferences.isEnabled()
         globalShortcut = GlobalShortcutPreferences.load()
         let prompts = PromptConfiguration.stored()
@@ -204,7 +307,7 @@ struct SettingsView: View {
         isError = false
     }
 
-    private func save() {
+    private func save(offerKeychainReconnect: Bool = true) {
         let prompts = PromptConfiguration(
             translate: translatePrompt,
             correct: correctPrompt,
@@ -238,9 +341,76 @@ struct SettingsView: View {
             statusMessage = "Saved"
             isError = false
             NotificationCenter.default.post(name: .translatorCredentialsDidChange, object: nil)
+        } catch let error as KeychainError
+            where error.requiresLoginKeychainReconnect && offerKeychainReconnect {
+            statusMessage = "The macOS login keychain needs to be reconnected."
+            isError = true
+            keychainReconnectShouldSave = true
+            showingKeychainReconnect = true
         } catch {
             statusMessage = error.localizedDescription
             isError = true
+        }
+    }
+
+    private func reconnectKeychain() {
+        do {
+            try keychain.reconnectDefaultKeychain()
+            if keychainReconnectShouldSave {
+                save(offerKeychainReconnect: false)
+            } else {
+                apiKey = try keychain.read() ?? ""
+                statusMessage = "Keychain reconnected"
+                isError = false
+                NotificationCenter.default.post(
+                    name: .translatorCredentialsDidChange,
+                    object: nil
+                )
+            }
+        } catch {
+            statusMessage = error.localizedDescription
+            isError = true
+        }
+    }
+
+    private func rebuildLearningProfile() {
+        manageLearningData(successMessage: "Learning profile rebuilt") {
+            _ = try await learningEngine.rebuildProfile()
+        }
+    }
+
+    private func resetLearningProgress() {
+        manageLearningData(successMessage: "Learning progress reset") {
+            _ = try await learningEngine.resetProgress()
+        }
+    }
+
+    private func deleteLearningData() {
+        manageLearningData(successMessage: "Learning data deleted") {
+            _ = try await learningEngine.deleteAllLearningData()
+        }
+    }
+
+    private func manageLearningData(
+        successMessage: String,
+        action: @escaping @Sendable () async throws -> Void
+    ) {
+        guard !isManagingLearningData else { return }
+        isManagingLearningData = true
+        Task {
+            do {
+                try await action()
+                statusMessage = successMessage
+                isError = false
+                NotificationCenter.default.post(
+                    name: .translatorLearningDataDidChange,
+                    object: nil
+                )
+            } catch {
+                statusMessage = error.localizedDescription
+                isError = true
+            }
+            isManagingLearningData = false
         }
     }
 }

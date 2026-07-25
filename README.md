@@ -10,6 +10,8 @@ App 位于 [`MacTranslator/`](MacTranslator/)，支持原 `wecom_translator` 的
 - `t ` / `T `：英文标准化、中文解释与中文翻译
 - `s ` / `S `：Slack 风格润色
 
+App 还提供独立的 **Learn** 页面：它会增量分析新的 `t` / `s` 记录，建立本地英语能力画像，并针对高频错误自动出题、判题、讲解和安排复习。学习过程采用只追加事件记录，App 重启后可以恢复未完成的题目和进度。
+
 快速运行：
 
 ```bash
@@ -37,6 +39,8 @@ cd MacTranslator
 API Key 在 App 设置中填写并保存在 macOS Keychain。完整说明见 [`MacTranslator/README.md`](MacTranslator/README.md)。
 
 聊天记录会保存在 SQLite 数据库 `~/Library/Application Support/MacTranslator/chat-history.sqlite3`，重启 App 后自动恢复。界面中的 “Clear” 会清空记录，右上角导出按钮可以导出为 JSON。App 界面语言为英文。
+
+学习事件、知识点投影、复习计划和 session 也保存在同一个 SQLite 数据库中。清空聊天不会自动删除已经提炼的学习画像；学习数据可以在 Settings → Learning 中单独重置、重建或永久删除。
 
 ## 旧企业微信实现
 
