@@ -16,13 +16,45 @@ s 这个需求我晚点跟进，先回滚 prod
 
 每条请求独立调用模型；窗口会保留本地显示历史，但不会把前文自动发给模型。这与原企业微信版本的行为一致。
 
+## Personal English Teacher
+
+主窗口左侧可以在 **Chat** 和 **Learn** 之间切换；侧栏可以收起为窄图标栏，减少对内容区域的占用。Learn 会形成完整的个人学习循环：
+
+1. 自动发现尚未分析的 `t` / `s` 记录。
+2. 只增量发送新记录，不重复发送完整历史。
+3. 区分真实英文能力证据与中文输入中的学习兴趣。
+4. 提取高频错误、正确使用证据和工作场景需求。
+5. 选择当前最值得练习的知识点。
+6. 每次展示一道自适应题目。
+7. 保存答案后使用结构化模型输出判题，并用简体中文解释。
+8. 根据题型、提示、重试和延迟复习更新掌握度。
+9. App 中断后从已保存的答案或题目继续。
+
+学习域使用事件溯源：聊天分析、问题、答案、判题和 session 状态都保存为只追加事件；当前知识点画像和复习队列是可以从事件重新生成的投影。
+
+默认的长期掌握条件不是“答对一次”，而是需要跨 session、跨题型并包含自由表达和延迟复习证据。单次 session 达标后只会显示“本轮完成”，后续仍会安排间隔复习。
+
 聊天记录会自动保存在 SQLite：
 
 ```text
 ~/Library/Application Support/MacTranslator/chat-history.sqlite3
 ```
 
-重新启动 App 时会自动恢复。点击 “Clear” 会同时删除内存与数据库中的记录。旧版 `chat-history.json` 会在首次启动时自动迁移到 SQLite 并删除。
+重新启动 App 时会自动恢复。点击 “Clear” 会删除原始聊天记录，但保留已经提炼的学习事件和画像。旧版 `chat-history.json` 会在首次启动时自动迁移到 SQLite 并删除。
+
+同一个数据库还会保存：
+
+- 稳定的 chat turn ID 与请求元数据
+- 只追加的学习事件
+- 可重建的知识点、session、同步覆盖和复习投影
+
+Settings 的 Learning 页面可以：
+
+- 重建学习画像
+- 重置练习进度并保留聊天弱项
+- 永久删除全部学习事件和派生示例
+
+Learn 页面可以单独导出完整的学习事件归档 JSON。
 
 右上角的导出按钮可以将当前完整记录导出为格式化 JSON。聊天正文只保存在本机；API Key 仍然只保存在 macOS Keychain。
 
@@ -38,7 +70,11 @@ s 这个需求我晚点跟进，先回滚 prod
 
 App 的界面语言为英文。
 
-Settings 的 Prompts 页面可以查看、修改或恢复 Default、`t` 和 `s` 三个 prompt。每次请求只会发送当前消息和本次选中的 prompt，SQLite 历史记录不会发送给 OpenAI。
+Settings 的 Prompts 页面可以查看、修改或恢复 Default、`t` 和 `s` 三个 prompt。Chat 请求只发送当前消息和本次选中的 prompt。Learn 会另外发送尚未分析的少量 `t` / `s` 记录，出题和判题时只发送当前知识点及当前答案，不会发送完整事件归档。
+
+Chat 和 Learn 共用 Settings → OpenAI 中的同一个 API Key 与模型配置，不需要为 Learn 单独配置。
+
+如果 macOS 返回 Keychain 错误 `-25293`，设置页会提供 **Reconnect and Save**。该操作让系统重新连接 login keychain，并由 macOS 自己询问 Mac 登录密码；应用不会读取或保存这段登录密码。
 
 输入框默认按 Return 发送；Shift+Return 或 Command+Return 插入换行。聊天区与输入区之间的分隔条可以上下拖动，调整两块区域的高度。
 
@@ -86,3 +122,12 @@ swift run MacTranslatorSelfTests
 ```
 
 这里使用零依赖自检程序，是因为只有 Command Line Tools、未安装完整 Xcode 的机器通常不包含 `XCTest` 框架。
+
+需要验证真实 Responses API 的流式与结构化学习闭环时：
+
+```bash
+cd MacTranslator
+OPENAI_API_KEY=... swift run MacTranslatorSelfTests --live-openai
+```
+
+真实闭环测试只使用合成句子，并将临时数据库写入系统临时目录，不读取正式聊天记录。

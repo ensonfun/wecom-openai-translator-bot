@@ -6,7 +6,7 @@ struct MacTranslatorApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ChatView()
+            MainContentView()
         }
         .defaultSize(width: 900, height: 760)
 

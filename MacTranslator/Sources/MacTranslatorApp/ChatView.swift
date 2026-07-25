@@ -49,7 +49,9 @@ struct ChatView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This permanently removes the conversation from this Mac.")
+            Text(
+                "This permanently removes the raw conversation. Your learning profile and sanitized learning examples remain until you delete them in Settings."
+            )
         }
     }
 
@@ -147,15 +149,9 @@ struct ChatView: View {
             .disabled(viewModel.messages.isEmpty)
             .help("Export chat history as JSON")
 
-            SettingsLink {
-                Image(systemName: "gearshape")
-                    .frame(width: 28, height: 28)
-            }
-            .buttonStyle(.plain)
-            .help("Settings")
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 14)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
     }
 
     private var commandGuide: some View {

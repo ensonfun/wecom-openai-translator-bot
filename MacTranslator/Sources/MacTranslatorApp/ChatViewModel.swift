@@ -6,6 +6,8 @@ import UniformTypeIdentifiers
 
 extension Notification.Name {
     static let translatorCredentialsDidChange = Notification.Name("translatorCredentialsDidChange")
+    static let translatorChatHistoryDidChange = Notification.Name("translatorChatHistoryDidChange")
+    static let translatorLearningDataDidChange = Notification.Name("translatorLearningDataDidChange")
 }
 
 @MainActor
@@ -61,9 +63,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     func refreshCredentials() {
-        let environmentKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"]
-        let keychainKey = try? keychain.read()
-        hasAPIKey = !(environmentKey ?? keychainKey ?? "").isEmpty
+        hasAPIKey = resolvedAPIKey() != nil
     }
 
     func send() {
@@ -82,21 +82,46 @@ final class ChatViewModel: ObservableObject {
         errorMessage = nil
         input = ""
 
-        let userMessage = ChatMessage(role: .user, text: command.userText, mode: command.mode)
+        let model = SharedOpenAIConfiguration.model
+        let turnID = UUID()
+        let createdAt = Date()
+        let userMessage = ChatMessage(
+            role: .user,
+            text: command.userText,
+            mode: command.mode,
+            turnID: turnID,
+            createdAt: createdAt
+        )
         messages.append(userMessage)
         persistNewMessage(userMessage, position: messages.count - 1)
 
         let responseID = UUID()
-        let responseMessage = ChatMessage(id: responseID, role: .assistant, text: "", mode: command.mode)
+        let responseMessage = ChatMessage(
+            id: responseID,
+            role: .assistant,
+            text: "",
+            mode: command.mode,
+            turnID: turnID,
+            createdAt: createdAt
+        )
         messages.append(responseMessage)
         persistNewMessage(responseMessage, position: messages.count - 1)
+        let turn = ChatTurn(
+            id: turnID,
+            mode: command.mode,
+            userMessageID: userMessage.id,
+            assistantMessageID: responseID,
+            createdAt: createdAt,
+            status: .streaming,
+            model: model,
+            promptFingerprint: PromptFingerprint.make(instructions)
+        )
+        persistTurn(turn)
         isSending = true
 
-        let model = AppSettings.resolvedModel(
-            UserDefaults.standard.string(forKey: AppSettings.modelKey)
-        )
         requestTask = Task { [weak self] in
             guard let self else { return }
+            var finalStatus = ChatTurn.Status.completed
             do {
                 let stream = client.streamResponse(
                     apiKey: apiKey,
@@ -111,12 +136,24 @@ final class ChatViewModel: ObservableObject {
                     replaceMessage(id: responseID, with: "(The model returned no text output.)")
                 }
             } catch is CancellationError {
+                finalStatus = .cancelled
                 removeMessageIfEmpty(id: responseID)
             } catch {
+                finalStatus = .failed
                 removeMessageIfEmpty(id: responseID)
                 errorMessage = error.localizedDescription
             }
             persistMessageImmediately(id: responseID)
+            var completedTurn = turn
+            completedTurn.completedAt = Date()
+            completedTurn.status = finalStatus
+            persistTurnImmediately(completedTurn)
+            if command.mode == .correct || command.mode == .slack {
+                NotificationCenter.default.post(
+                    name: .translatorChatHistoryDidChange,
+                    object: turnID
+                )
+            }
             isSending = false
             requestTask = nil
         }
@@ -161,10 +198,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     private func resolvedAPIKey() -> String? {
-        if let environmentKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"], !environmentKey.isEmpty {
-            return environmentKey
-        }
-        return try? keychain.read()
+        SharedOpenAIConfiguration.apiKey(from: keychain)
     }
 
     private func migrateUnavailablePreviewModel() {
@@ -205,6 +239,18 @@ final class ChatViewModel: ObservableObject {
     private func persistNewMessage(_ message: ChatMessage, position: Int) {
         historyQueue.async { [historyStore] in
             try? historyStore.upsert(message, position: position)
+        }
+    }
+
+    private func persistTurn(_ turn: ChatTurn) {
+        historyQueue.async { [historyStore] in
+            try? historyStore.upsertTurn(turn)
+        }
+    }
+
+    private func persistTurnImmediately(_ turn: ChatTurn) {
+        historyQueue.sync {
+            try? historyStore.upsertTurn(turn)
         }
     }
 
