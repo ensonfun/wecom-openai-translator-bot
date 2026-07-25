@@ -39,18 +39,37 @@ public struct OpenAIClient: Sendable {
         apiKey: String,
         model: String,
         instructions: String,
-        input: String
+        input: String,
+        diagnosticContext: DiagnosticRequestContext = DiagnosticRequestContext(flow: "chat")
     ) -> AsyncThrowingStream<String, Error> {
-        AsyncThrowingStream { continuation in
+        diagnosticLogger.registerSecret(apiKey)
+        let requestContext = DiagnosticRequestContext(
+            flow: diagnosticContext.flow,
+            operationID: diagnosticContext.operationID,
+            details: diagnosticContext.details.merging([
+                "endpoint": .string(endpoint.absoluteString),
+                "store": .boolean(false),
+                "stream": .boolean(true)
+            ]) { _, new in new }
+        )
+        return AsyncThrowingStream { continuation in
             let task = Task {
                 let requestID = UUID()
                 let startedAt = Date()
                 var receivedText = false
+                var outputText = ""
                 var attempt = 0
 
                 while true {
                     attempt += 1
-                    diagnosticLogger.requestStarted(requestID: requestID, attempt: attempt)
+                    diagnosticLogger.requestStarted(
+                        requestID: requestID,
+                        attempt: attempt,
+                        context: requestContext,
+                        model: model,
+                        instructions: attempt == 1 ? instructions : nil,
+                        input: attempt == 1 ? input : nil
+                    )
 
                     do {
                         var request = URLRequest(url: endpoint)
@@ -75,7 +94,9 @@ public struct OpenAIClient: Sendable {
                             requestID: requestID,
                             attempt: attempt,
                             statusCode: httpResponse.statusCode,
-                            openAIRequestID: httpResponse.value(forHTTPHeaderField: "x-request-id")
+                            openAIRequestID: httpResponse.value(forHTTPHeaderField: "x-request-id"),
+                            headers: Self.responseHeaders(httpResponse),
+                            context: requestContext
                         )
 
                         guard (200..<300).contains(httpResponse.statusCode) else {
@@ -95,17 +116,81 @@ public struct OpenAIClient: Sendable {
                             try Task.checkCancellation()
                             guard line.hasPrefix("data: ") else { continue }
                             let payload = String(line.dropFirst(6))
-                            guard payload != "[DONE]", let data = payload.data(using: .utf8) else { continue }
+                            if payload == "[DONE]" {
+                                diagnosticLogger.event(
+                                    "stream_done_received",
+                                    component: "openai",
+                                    operationID: requestContext.operationID,
+                                    details: [
+                                        "flow": .string(requestContext.flow),
+                                        "request_id": .string(requestID.uuidString),
+                                        "attempt": .integer(attempt)
+                                    ]
+                                )
+                                continue
+                            }
+                            guard let data = payload.data(using: .utf8) else { continue }
 
-                            switch try OpenAIStreamEventParser.parse(data) {
+                            let parsedEvent: OpenAIStreamEventOutcome
+                            do {
+                                parsedEvent = try OpenAIStreamEventParser.parse(data)
+                            } catch {
+                                diagnosticLogger.event(
+                                    "stream_event_parse_failed",
+                                    level: .error,
+                                    component: "openai",
+                                    operationID: requestContext.operationID,
+                                    failure: DiagnosticFailure.from(error),
+                                    details: [
+                                        "flow": .string(requestContext.flow),
+                                        "request_id": .string(requestID.uuidString),
+                                        "attempt": .integer(attempt),
+                                        "raw_event": .string(payload)
+                                    ]
+                                )
+                                throw error
+                            }
+
+                            switch parsedEvent {
                             case .textDelta(let delta):
                                 if !delta.isEmpty {
                                     receivedText = true
+                                    outputText += delta
                                     continuation.yield(delta)
                                 }
                             case .failure(let message):
+                                diagnosticLogger.event(
+                                    "stream_failure_event_received",
+                                    level: .error,
+                                    component: "openai",
+                                    operationID: requestContext.operationID,
+                                    failure: DiagnosticFailure(
+                                        statusCode: nil,
+                                        errorDomain: "OpenAI.StreamEvent",
+                                        errorCode: nil,
+                                        message: message
+                                    ),
+                                    details: [
+                                        "flow": .string(requestContext.flow),
+                                        "request_id": .string(requestID.uuidString),
+                                        "attempt": .integer(attempt),
+                                        "raw_event": .string(payload)
+                                    ]
+                                )
                                 throw OpenAIClientError.stream(message)
                             case .ignored:
+                                diagnosticLogger.event(
+                                    "stream_lifecycle_event_received",
+                                    level: .debug,
+                                    component: "openai",
+                                    operationID: requestContext.operationID,
+                                    details: [
+                                        "flow": .string(requestContext.flow),
+                                        "request_id": .string(requestID.uuidString),
+                                        "attempt": .integer(attempt),
+                                        "raw_event": .string(payload)
+                                    ]
+                                )
                                 continue
                             }
                         }
@@ -114,7 +199,9 @@ public struct OpenAIClient: Sendable {
                             requestID: requestID,
                             attempt: attempt,
                             receivedText: receivedText,
-                            durationMilliseconds: Self.elapsedMilliseconds(since: startedAt)
+                            durationMilliseconds: Self.elapsedMilliseconds(since: startedAt),
+                            outputText: outputText,
+                            context: requestContext
                         )
                         continuation.finish()
                         return
@@ -130,7 +217,8 @@ public struct OpenAIClient: Sendable {
                                 requestID: requestID,
                                 attempt: attempt,
                                 delayMilliseconds: Int(delay / 1_000_000),
-                                failure: failure
+                                failure: failure,
+                                context: requestContext
                             )
                             do {
                                 try await Task.sleep(nanoseconds: delay)
@@ -141,7 +229,9 @@ public struct OpenAIClient: Sendable {
                                     attempt: attempt,
                                     receivedText: receivedText,
                                     durationMilliseconds: Self.elapsedMilliseconds(since: startedAt),
-                                    failure: Self.diagnosticFailure(for: error)
+                                    failure: Self.diagnosticFailure(for: error),
+                                    outputText: outputText.isEmpty ? nil : outputText,
+                                    context: requestContext
                                 )
                                 continuation.finish(throwing: error)
                                 return
@@ -153,7 +243,9 @@ public struct OpenAIClient: Sendable {
                             attempt: attempt,
                             receivedText: receivedText,
                             durationMilliseconds: Self.elapsedMilliseconds(since: startedAt),
-                            failure: failure
+                            failure: failure,
+                            outputText: outputText.isEmpty ? nil : outputText,
+                            context: requestContext
                         )
                         continuation.finish(throwing: error)
                         return
@@ -175,8 +267,22 @@ public struct OpenAIClient: Sendable {
         schemaName: String,
         schema: JSONValue,
         maxOutputTokens: Int = 2_000,
+        diagnosticContext: DiagnosticRequestContext = DiagnosticRequestContext(
+            flow: "structured"
+        ),
         outputType: Output.Type = Output.self
     ) async throws -> Output {
+        diagnosticLogger.registerSecret(apiKey)
+        let requestContext = DiagnosticRequestContext(
+            flow: diagnosticContext.flow,
+            operationID: diagnosticContext.operationID,
+            details: diagnosticContext.details.merging([
+                "endpoint": .string(endpoint.absoluteString),
+                "store": .boolean(false),
+                "stream": .boolean(false),
+                "max_output_tokens": .integer(maxOutputTokens)
+            ]) { _, new in new }
+        )
         let data = try await structuredResponseData(
             apiKey: apiKey,
             model: model,
@@ -184,11 +290,24 @@ public struct OpenAIClient: Sendable {
             input: input,
             schemaName: schemaName,
             schema: schema,
-            maxOutputTokens: maxOutputTokens
+            maxOutputTokens: maxOutputTokens,
+            diagnosticContext: requestContext
         )
         do {
             return try JSONDecoder().decode(Output.self, from: data)
         } catch {
+            diagnosticLogger.event(
+                "structured_output_decode_failed",
+                level: .error,
+                component: "openai",
+                operationID: requestContext.operationID,
+                failure: DiagnosticFailure.from(error),
+                details: [
+                    "flow": .string(requestContext.flow),
+                    "schema_name": .string(schemaName),
+                    "output": .string(String(data: data, encoding: .utf8) ?? "")
+                ]
+            )
             throw OpenAIClientError.stream("The structured response did not match the app's data model.")
         }
     }
@@ -200,15 +319,29 @@ public struct OpenAIClient: Sendable {
         input: String,
         schemaName: String,
         schema: JSONValue,
-        maxOutputTokens: Int
+        maxOutputTokens: Int,
+        diagnosticContext: DiagnosticRequestContext
     ) async throws -> Data {
         let requestID = UUID()
         let startedAt = Date()
         var attempt = 0
+        var responseText: String?
+        let schemaText = (try? JSONEncoder().encode(schema))
+            .flatMap { String(data: $0, encoding: .utf8) }
 
         while true {
             attempt += 1
-            diagnosticLogger.requestStarted(requestID: requestID, attempt: attempt)
+            responseText = nil
+            diagnosticLogger.requestStarted(
+                requestID: requestID,
+                attempt: attempt,
+                context: diagnosticContext,
+                model: model,
+                instructions: attempt == 1 ? instructions : nil,
+                input: attempt == 1 ? input : nil,
+                schemaName: attempt == 1 ? schemaName : nil,
+                schema: attempt == 1 ? schemaText : nil
+            )
             do {
                 var request = URLRequest(url: endpoint)
                 request.httpMethod = "POST"
@@ -233,6 +366,7 @@ public struct OpenAIClient: Sendable {
                 )
 
                 let (data, response) = try await session.data(for: request)
+                responseText = String(data: data, encoding: .utf8)
                 guard let httpResponse = response as? HTTPURLResponse else {
                     throw OpenAIClientError.invalidResponse
                 }
@@ -240,7 +374,9 @@ public struct OpenAIClient: Sendable {
                     requestID: requestID,
                     attempt: attempt,
                     statusCode: httpResponse.statusCode,
-                    openAIRequestID: httpResponse.value(forHTTPHeaderField: "x-request-id")
+                    openAIRequestID: httpResponse.value(forHTTPHeaderField: "x-request-id"),
+                    headers: Self.responseHeaders(httpResponse),
+                    context: diagnosticContext
                 )
                 guard (200..<300).contains(httpResponse.statusCode) else {
                     let envelope = try? JSONDecoder().decode(APIErrorEnvelope.self, from: data)
@@ -267,7 +403,9 @@ public struct OpenAIClient: Sendable {
                                 requestID: requestID,
                                 attempt: attempt,
                                 receivedText: true,
-                                durationMilliseconds: Self.elapsedMilliseconds(since: startedAt)
+                                durationMilliseconds: Self.elapsedMilliseconds(since: startedAt),
+                                outputText: text,
+                                context: diagnosticContext
                             )
                             return outputData
                         }
@@ -291,7 +429,8 @@ public struct OpenAIClient: Sendable {
                         requestID: requestID,
                         attempt: attempt,
                         delayMilliseconds: Int(delay / 1_000_000),
-                        failure: failure
+                        failure: failure,
+                        context: diagnosticContext
                     )
                     try await Task.sleep(nanoseconds: delay)
                     continue
@@ -301,7 +440,9 @@ public struct OpenAIClient: Sendable {
                     attempt: attempt,
                     receivedText: false,
                     durationMilliseconds: Self.elapsedMilliseconds(since: startedAt),
-                    failure: failure
+                    failure: failure,
+                    outputText: responseText,
+                    context: diagnosticContext
                 )
                 throw error
             }
@@ -335,19 +476,29 @@ public struct OpenAIClient: Sendable {
             return DiagnosticFailure(
                 statusCode: statusCode,
                 errorDomain: "OpenAIClientError",
-                errorCode: statusCode
+                errorCode: statusCode,
+                message: error.localizedDescription
             )
         }
         let nsError = error as NSError
         return DiagnosticFailure(
             statusCode: nil,
             errorDomain: nsError.domain,
-            errorCode: nsError.code
+            errorCode: nsError.code,
+            message: error.localizedDescription
         )
     }
 
     private static func elapsedMilliseconds(since start: Date) -> Int {
         max(0, Int(Date().timeIntervalSince(start) * 1_000))
+    }
+
+    private static func responseHeaders(
+        _ response: HTTPURLResponse
+    ) -> [String: String] {
+        Dictionary(uniqueKeysWithValues: response.allHeaderFields.map {
+            (String(describing: $0.key), String(describing: $0.value))
+        })
     }
 }
 

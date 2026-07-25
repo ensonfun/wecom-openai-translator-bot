@@ -66,7 +66,18 @@ Learn 页面可以单独导出完整的学习事件归档 JSON。
 ~/Library/Logs/MacTranslator/MacTranslator.log
 ```
 
-日志按 1 MiB 轮转，最多保留 5 个旧文件（`.1` 到 `.5`）。其中只记录请求编号、尝试次数、HTTP 状态、错误域/错误码、是否收到文字、重试等待时间和耗时；不会记录 API Key、prompt、聊天正文或模型返回正文。
+日志采用 JSON Lines 格式，单个文件达到 5 MiB 后自动轮转，最多保留 7 个旧文件（`.1` 到 `.7`）。日志会记录足够还原问题现场的信息，包括：
+
+- App 版本、macOS 版本、启动、正常退出与上次异常退出
+- Chat 的命令、prompt、输入、完整或部分模型输出及持久化状态
+- OpenAI 请求阶段、模型、HTTP 状态、request ID、重试、耗时和错误详情
+- Learn 的历史同步、证据提取、出题、答案、判题、讲解和 session 状态
+- SQLite 事件写入、投影重建、Keychain、设置与全局快捷键操作
+- 错误域、错误码、错误说明、源代码位置和调用栈
+
+只有 OpenAI API Key 会被强制脱敏；即使 Key 出现在聊天正文、错误信息或 Authorization 文本中也会替换为 `<redacted-api-key>`。为了能够在无需复现的情况下定位问题，其他聊天与学习内容会写入本机日志。
+
+Settings → Diagnostics 可以在 Finder 中打开日志目录，也可以把当前文件和所有轮转文件合并导出为一个 `.jsonl` 文件。
 
 App 的界面语言为英文。
 

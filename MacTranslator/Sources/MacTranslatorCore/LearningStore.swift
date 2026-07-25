@@ -6,8 +6,12 @@ public struct LearningStore: Sendable {
     public static let projectorVersion = 1
 
     public let databaseURL: URL
+    private let diagnosticLogger: DiagnosticLogger
 
-    public init(directoryURL: URL? = nil) {
+    public init(
+        directoryURL: URL? = nil,
+        diagnosticLogger: DiagnosticLogger = .shared
+    ) {
         let directory: URL
         if let directoryURL {
             directory = directoryURL
@@ -19,32 +23,63 @@ public struct LearningStore: Sendable {
             directory = applicationSupport.appendingPathComponent("MacTranslator", isDirectory: true)
         }
         databaseURL = directory.appendingPathComponent("chat-history.sqlite3", isDirectory: false)
+        self.diagnosticLogger = diagnosticLogger
     }
 
     @discardableResult
     public func append(_ events: [PendingLearningEvent]) throws -> Int {
         guard !events.isEmpty else { return 0 }
-        let inserted = try withDatabase { database in
-            let epoch = try currentEpoch(database)
-            try execute("BEGIN IMMEDIATE TRANSACTION;", database: database)
-            do {
-                var inserted = 0
-                for event in events {
-                    if try insert(event, defaultEpoch: epoch, database: database) {
-                        inserted += 1
+        do {
+            let inserted = try withDatabase { database in
+                let epoch = try currentEpoch(database)
+                try execute("BEGIN IMMEDIATE TRANSACTION;", database: database)
+                do {
+                    var inserted = 0
+                    for event in events {
+                        if try insert(event, defaultEpoch: epoch, database: database) {
+                            inserted += 1
+                        }
                     }
+                    try execute("COMMIT;", database: database)
+                    return inserted
+                } catch {
+                    try? execute("ROLLBACK;", database: database)
+                    throw error
                 }
-                try execute("COMMIT;", database: database)
-                return inserted
-            } catch {
-                try? execute("ROLLBACK;", database: database)
-                throw error
             }
+            diagnosticLogger.event(
+                "learning_events_appended",
+                component: "storage",
+                operationID: events.first?.correlationID ?? events.first?.sessionID,
+                details: [
+                    "requested_event_count": .integer(events.count),
+                    "inserted_event_count": .integer(inserted),
+                    "database_path": .string(databaseURL.path),
+                    "event_types": .strings(events.map { $0.type.rawValue }),
+                    "event_ids": .strings(events.map { $0.id.uuidString }),
+                    "payloads": .strings(events.map(\.payloadJSON))
+                ]
+            )
+            if inserted > 0 {
+                try rebuildProjections()
+            }
+            return inserted
+        } catch {
+            diagnosticLogger.event(
+                "learning_events_append_failed",
+                level: .error,
+                component: "storage",
+                operationID: events.first?.correlationID ?? events.first?.sessionID,
+                failure: DiagnosticFailure.from(error),
+                details: [
+                    "event_types": .strings(events.map { $0.type.rawValue }),
+                    "event_ids": .strings(events.map { $0.id.uuidString }),
+                    "payloads": .strings(events.map(\.payloadJSON)),
+                    "database_path": .string(databaseURL.path)
+                ]
+            )
+            throw error
         }
-        if inserted > 0 {
-            try rebuildProjections()
-        }
-        return inserted
     }
 
     @discardableResult
@@ -101,58 +136,84 @@ public struct LearningStore: Sendable {
     }
 
     public func rebuildProjections() throws {
-        try withDatabase { database in
-            let events = try readEvents(database)
-            let state = try ProjectionReducer.reduce(events)
-            try execute("BEGIN IMMEDIATE TRANSACTION;", database: database)
-            do {
-                try execute("DELETE FROM learning_knowledge_projection;", database: database)
-                try execute("DELETE FROM learning_session_projection;", database: database)
-                try execute("DELETE FROM learning_source_projection;", database: database)
+        do {
+            var projectionDetails: [String: DiagnosticValue] = [:]
+            try withDatabase { database in
+                let events = try readEvents(database)
+                let state = try ProjectionReducer.reduce(events)
+                try execute("BEGIN IMMEDIATE TRANSACTION;", database: database)
+                do {
+                    try execute("DELETE FROM learning_knowledge_projection;", database: database)
+                    try execute("DELETE FROM learning_session_projection;", database: database)
+                    try execute("DELETE FROM learning_source_projection;", database: database)
 
-                for knowledge in state.knowledge.values {
-                    try insertKnowledge(knowledge.snapshot, database: database)
-                }
-                for session in state.sessions.values {
-                    try insertSession(session, database: database)
-                }
-                for coverage in state.coverage.values {
-                    try insertCoverage(coverage, database: database)
-                }
+                    for knowledge in state.knowledge.values {
+                        try insertKnowledge(knowledge.snapshot, database: database)
+                    }
+                    for session in state.sessions.values {
+                        try insertSession(session, database: database)
+                    }
+                    for coverage in state.coverage.values {
+                        try insertCoverage(coverage, database: database)
+                    }
 
-                let checkpoint = events.last?.sequence ?? 0
-                let statement = try prepare(
-                    """
-                    INSERT INTO learning_projection_checkpoints (
-                        projector_name, projector_version, last_sequence, updated_at
-                    )
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(projector_name) DO UPDATE SET
-                        projector_version = excluded.projector_version,
-                        last_sequence = excluded.last_sequence,
-                        updated_at = excluded.updated_at;
-                    """,
-                    database: database
-                )
-                defer { sqlite3_finalize(statement) }
-                try bind(Self.projectorName, at: 1, to: statement, database: database)
-                try bind(Int64(Self.projectorVersion), at: 2, to: statement, database: database)
-                try bind(checkpoint, at: 3, to: statement, database: database)
-                try bind(Date().timeIntervalSince1970, at: 4, to: statement, database: database)
-                try stepDone(statement, database: database)
-
-                if let currentEpoch = state.currentEpoch {
-                    try setMetadata(
-                        key: "current_epoch",
-                        value: currentEpoch.uuidString,
+                    let checkpoint = events.last?.sequence ?? 0
+                    let statement = try prepare(
+                        """
+                        INSERT INTO learning_projection_checkpoints (
+                            projector_name, projector_version, last_sequence, updated_at
+                        )
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(projector_name) DO UPDATE SET
+                            projector_version = excluded.projector_version,
+                            last_sequence = excluded.last_sequence,
+                            updated_at = excluded.updated_at;
+                        """,
                         database: database
                     )
+                    defer { sqlite3_finalize(statement) }
+                    try bind(Self.projectorName, at: 1, to: statement, database: database)
+                    try bind(Int64(Self.projectorVersion), at: 2, to: statement, database: database)
+                    try bind(checkpoint, at: 3, to: statement, database: database)
+                    try bind(Date().timeIntervalSince1970, at: 4, to: statement, database: database)
+                    try stepDone(statement, database: database)
+
+                    if let currentEpoch = state.currentEpoch {
+                        try setMetadata(
+                            key: "current_epoch",
+                            value: currentEpoch.uuidString,
+                            database: database
+                        )
+                    }
+                    try execute("COMMIT;", database: database)
+                    projectionDetails = [
+                        "event_count": .integer(events.count),
+                        "knowledge_point_count": .integer(state.knowledge.count),
+                        "session_count": .integer(state.sessions.count),
+                        "source_turn_count": .integer(state.coverage.count),
+                        "checkpoint": .integer(Int(checkpoint))
+                    ]
+                } catch {
+                    try? execute("ROLLBACK;", database: database)
+                    throw error
                 }
-                try execute("COMMIT;", database: database)
-            } catch {
-                try? execute("ROLLBACK;", database: database)
-                throw error
             }
+            diagnosticLogger.event(
+                "learning_projections_rebuilt",
+                component: "storage",
+                details: projectionDetails.merging(
+                    ["database_path": .string(databaseURL.path)]
+                ) { _, new in new }
+            )
+        } catch {
+            diagnosticLogger.event(
+                "learning_projection_rebuild_failed",
+                level: .error,
+                component: "storage",
+                failure: DiagnosticFailure.from(error),
+                details: ["database_path": .string(databaseURL.path)]
+            )
+            throw error
         }
     }
 

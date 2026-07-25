@@ -45,6 +45,30 @@ struct MainContentView: View {
         }
         .animation(.easeInOut(duration: 0.18), value: isSidebarExpanded)
         .frame(minWidth: 780, minHeight: 620)
+        .onAppear {
+            DiagnosticLogger.shared.event(
+                "main_window_appeared",
+                component: "navigation",
+                details: [
+                    "destination": .string(destination.rawValue),
+                    "sidebar_expanded": .boolean(isSidebarExpanded)
+                ]
+            )
+        }
+        .onChange(of: destination) { _, newValue in
+            DiagnosticLogger.shared.event(
+                "main_destination_changed",
+                component: "navigation",
+                details: ["destination": .string(newValue.rawValue)]
+            )
+        }
+        .onChange(of: isSidebarExpanded) { _, newValue in
+            DiagnosticLogger.shared.event(
+                "main_sidebar_toggled",
+                component: "navigation",
+                details: ["expanded": .boolean(newValue)]
+            )
+        }
     }
 
     private var navigationRail: some View {
