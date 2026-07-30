@@ -18,20 +18,32 @@ public enum OpenAIClientError: LocalizedError {
 }
 
 public struct OpenAIClient: Sendable {
+    private static let structuredContentRetryInstructions = """
+
+
+    The previous structured response was incomplete or could not be decoded.
+    Return the entire JSON object again from the beginning.
+    Keep every string concise. Do not pad any field with spaces, tabs, or blank lines.
+    Copy every short ID from the input exactly. Return JSON only.
+    """
+
     private let endpoint: URL
     private let session: URLSession
     private let diagnosticLogger: DiagnosticLogger
+    private let learningDebugStore: LearningDebugStore
     private let retryDelayNanoseconds: [UInt64]
 
     public init(
         endpoint: URL = URL(string: "https://api.openai.com/v1/responses")!,
         session: URLSession = .shared,
         diagnosticLogger: DiagnosticLogger = .shared,
+        learningDebugStore: LearningDebugStore = .shared,
         retryDelayNanoseconds: [UInt64] = [500_000_000, 1_000_000_000]
     ) {
         self.endpoint = endpoint
         self.session = session
         self.diagnosticLogger = diagnosticLogger
+        self.learningDebugStore = learningDebugStore
         self.retryDelayNanoseconds = Array(retryDelayNanoseconds.prefix(2))
     }
 
@@ -283,33 +295,77 @@ public struct OpenAIClient: Sendable {
                 "max_output_tokens": .integer(maxOutputTokens)
             ]) { _, new in new }
         )
-        let data = try await structuredResponseData(
-            apiKey: apiKey,
-            model: model,
-            instructions: instructions,
-            input: input,
-            schemaName: schemaName,
-            schema: schema,
-            maxOutputTokens: maxOutputTokens,
-            diagnosticContext: requestContext
-        )
-        do {
-            return try JSONDecoder().decode(Output.self, from: data)
-        } catch {
-            diagnosticLogger.event(
-                "structured_output_decode_failed",
-                level: .error,
-                component: "openai",
-                operationID: requestContext.operationID,
-                failure: DiagnosticFailure.from(error),
-                details: [
-                    "flow": .string(requestContext.flow),
-                    "schema_name": .string(schemaName),
-                    "output": .string(String(data: data, encoding: .utf8) ?? "")
-                ]
-            )
-            throw OpenAIClientError.stream("The structured response did not match the app's data model.")
+        for contentAttempt in 1...2 {
+            let retryingContent = contentAttempt == 2
+            let attemptInstructions = retryingContent
+                ? instructions + Self.structuredContentRetryInstructions
+                : instructions
+            do {
+                let payload = try await structuredResponseData(
+                    apiKey: apiKey,
+                    model: model,
+                    instructions: attemptInstructions,
+                    input: input,
+                    schemaName: schemaName,
+                    schema: schema,
+                    maxOutputTokens: maxOutputTokens,
+                    diagnosticContext: requestContext
+                )
+                do {
+                    return try JSONDecoder().decode(Output.self, from: payload.data)
+                } catch {
+                    let decodingMessage = Self.structuredDecodingFailureDescription(error)
+                    diagnosticLogger.event(
+                        "structured_output_decode_failed",
+                        level: .error,
+                        component: "openai",
+                        operationID: requestContext.operationID,
+                        failure: DiagnosticFailure.from(error),
+                        details: [
+                            "flow": .string(requestContext.flow),
+                            "schema_name": .string(schemaName),
+                            "content_attempt": .integer(contentAttempt),
+                            "output": .string(
+                                String(data: payload.data, encoding: .utf8) ?? ""
+                            )
+                        ]
+                    )
+                    learningDebugStore.requestFailed(
+                        requestID: payload.requestID,
+                        response: String(data: payload.data, encoding: .utf8),
+                        attempt: payload.transportAttempt,
+                        durationMilliseconds: payload.durationMilliseconds,
+                        errorMessage: decodingMessage
+                    )
+                    if !retryingContent {
+                        logStructuredContentRetry(
+                            context: requestContext,
+                            schemaName: schemaName,
+                            reason: decodingMessage
+                        )
+                        continue
+                    }
+                    throw OpenAIClientError.stream(
+                        "\(decodingMessage) The app retried once, but the second response "
+                            + "was also invalid. Open Learn Debug for the raw response."
+                    )
+                }
+            } catch let failure as StructuredContentFailure {
+                if !retryingContent {
+                    logStructuredContentRetry(
+                        context: requestContext,
+                        schemaName: schemaName,
+                        reason: failure.localizedDescription
+                    )
+                    continue
+                }
+                throw OpenAIClientError.stream(
+                    "\(failure.localizedDescription) The app retried once, but the second "
+                        + "response was also incomplete. Open Learn Debug for the raw response."
+                )
+            }
         }
+        throw OpenAIClientError.invalidResponse
     }
 
     private func structuredResponseData(
@@ -321,17 +377,21 @@ public struct OpenAIClient: Sendable {
         schema: JSONValue,
         maxOutputTokens: Int,
         diagnosticContext: DiagnosticRequestContext
-    ) async throws -> Data {
+    ) async throws -> StructuredResponsePayload {
         let requestID = UUID()
         let startedAt = Date()
         var attempt = 0
         var responseText: String?
+        var outputText: String?
+        var tokenUsage: LearningTokenUsage?
         let schemaText = (try? JSONEncoder().encode(schema))
             .flatMap { String(data: $0, encoding: .utf8) }
 
         while true {
             attempt += 1
             responseText = nil
+            outputText = nil
+            tokenUsage = nil
             diagnosticLogger.requestStarted(
                 requestID: requestID,
                 attempt: attempt,
@@ -341,6 +401,14 @@ public struct OpenAIClient: Sendable {
                 input: attempt == 1 ? input : nil,
                 schemaName: attempt == 1 ? schemaName : nil,
                 schema: attempt == 1 ? schemaText : nil
+            )
+            learningDebugStore.requestStarted(
+                requestID: requestID,
+                flow: diagnosticContext.flow,
+                model: model,
+                instructions: instructions,
+                input: input,
+                attempt: attempt
             )
             do {
                 var request = URLRequest(url: endpoint)
@@ -391,6 +459,12 @@ public struct OpenAIClient: Sendable {
                 if let error = envelope.error {
                     throw OpenAIClientError.stream(error.message)
                 }
+                tokenUsage = Self.learningTokenUsage(from: envelope.usage)
+                outputText = Self.structuredOutputText(from: envelope)
+                if envelope.status == "incomplete" {
+                    let reason = envelope.incompleteDetails?.reason ?? "unknown reason"
+                    throw StructuredContentFailure.incomplete(reason: reason)
+                }
                 for output in envelope.output {
                     guard output.type == "message" else { continue }
                     for content in output.content {
@@ -399,23 +473,33 @@ public struct OpenAIClient: Sendable {
                         }
                         if content.type == "output_text", let text = content.text,
                            let outputData = text.data(using: .utf8) {
+                            let durationMilliseconds = Self.elapsedMilliseconds(
+                                since: startedAt
+                            )
                             diagnosticLogger.requestCompleted(
                                 requestID: requestID,
                                 attempt: attempt,
                                 receivedText: true,
-                                durationMilliseconds: Self.elapsedMilliseconds(since: startedAt),
+                                durationMilliseconds: durationMilliseconds,
                                 outputText: text,
+                                tokenUsage: tokenUsage,
                                 context: diagnosticContext
                             )
-                            return outputData
+                            learningDebugStore.requestCompleted(
+                                requestID: requestID,
+                                response: text,
+                                tokenUsage: tokenUsage,
+                                attempt: attempt,
+                                durationMilliseconds: durationMilliseconds
+                            )
+                            return StructuredResponsePayload(
+                                requestID: requestID,
+                                data: outputData,
+                                transportAttempt: attempt,
+                                durationMilliseconds: durationMilliseconds
+                            )
                         }
                     }
-                }
-                if envelope.status == "incomplete" {
-                    throw OpenAIClientError.stream(
-                        envelope.incompleteDetails?.reason
-                            ?? "The structured response was incomplete."
-                    )
                 }
                 throw OpenAIClientError.invalidResponse
             } catch {
@@ -438,11 +522,19 @@ public struct OpenAIClient: Sendable {
                 diagnosticLogger.requestFailed(
                     requestID: requestID,
                     attempt: attempt,
-                    receivedText: false,
+                    receivedText: outputText?.isEmpty == false,
                     durationMilliseconds: Self.elapsedMilliseconds(since: startedAt),
                     failure: failure,
-                    outputText: responseText,
+                    outputText: outputText ?? responseText,
                     context: diagnosticContext
+                )
+                learningDebugStore.requestFailed(
+                    requestID: requestID,
+                    response: outputText ?? responseText,
+                    tokenUsage: tokenUsage,
+                    attempt: attempt,
+                    durationMilliseconds: Self.elapsedMilliseconds(since: startedAt),
+                    errorMessage: error.localizedDescription
                 )
                 throw error
             }
@@ -491,6 +583,86 @@ public struct OpenAIClient: Sendable {
 
     private static func elapsedMilliseconds(since start: Date) -> Int {
         max(0, Int(Date().timeIntervalSince(start) * 1_000))
+    }
+
+    private func logStructuredContentRetry(
+        context: DiagnosticRequestContext,
+        schemaName: String,
+        reason: String
+    ) {
+        diagnosticLogger.event(
+            "structured_content_retry_scheduled",
+            level: .warning,
+            component: "openai",
+            operationID: context.operationID,
+            details: [
+                "flow": .string(context.flow),
+                "schema_name": .string(schemaName),
+                "reason": .string(reason),
+                "next_content_attempt": .integer(2)
+            ]
+        )
+    }
+
+    private static func learningTokenUsage(
+        from usage: StructuredResponseUsage?
+    ) -> LearningTokenUsage? {
+        usage.map {
+            LearningTokenUsage(
+                inputTokens: $0.inputTokens,
+                outputTokens: $0.outputTokens,
+                totalTokens: $0.totalTokens,
+                cachedInputTokens: $0.inputTokensDetails?.cachedTokens,
+                reasoningOutputTokens: $0.outputTokensDetails?.reasoningTokens
+            )
+        }
+    }
+
+    private static func structuredOutputText(
+        from envelope: StructuredResponseEnvelope
+    ) -> String? {
+        envelope.output.lazy
+            .filter { $0.type == "message" }
+            .flatMap(\.content)
+            .first { $0.type == "output_text" }?
+            .text
+    }
+
+    private static func structuredDecodingFailureDescription(_ error: Error) -> String {
+        let prefix = "The structured response could not be decoded"
+        guard let decodingError = error as? DecodingError else {
+            return "\(prefix): \(error.localizedDescription)"
+        }
+        switch decodingError {
+        case .keyNotFound(let key, let context):
+            return "\(prefix): missing required field "
+                + "'\(codingPath(context.codingPath + [key]))'."
+        case .typeMismatch(let type, let context):
+            return "\(prefix): field '\(codingPath(context.codingPath))' "
+                + "was not a \(String(describing: type))."
+        case .valueNotFound(let type, let context):
+            return "\(prefix): field '\(codingPath(context.codingPath))' "
+                + "was null instead of \(String(describing: type))."
+        case .dataCorrupted(let context):
+            return "\(prefix) at '\(codingPath(context.codingPath))': "
+                + context.debugDescription
+        @unknown default:
+            return "\(prefix): \(error.localizedDescription)"
+        }
+    }
+
+    private static func codingPath(_ keys: [any CodingKey]) -> String {
+        guard !keys.isEmpty else { return "<root>" }
+        var result = ""
+        for key in keys {
+            if let index = key.intValue {
+                result += "[\(index)]"
+            } else {
+                if !result.isEmpty { result += "." }
+                result += key.stringValue
+            }
+        }
+        return result
     }
 
     private static func responseHeaders(
@@ -570,12 +742,67 @@ private struct StructuredResponseEnvelope: Decodable {
     let error: APIErrorDetail?
     let incompleteDetails: StructuredIncompleteDetails?
     let output: [StructuredOutputItem]
+    let usage: StructuredResponseUsage?
 
     enum CodingKeys: String, CodingKey {
         case status
         case error
         case incompleteDetails = "incomplete_details"
         case output
+        case usage
+    }
+}
+
+private struct StructuredResponsePayload {
+    let requestID: UUID
+    let data: Data
+    let transportAttempt: Int
+    let durationMilliseconds: Int
+}
+
+private enum StructuredContentFailure: LocalizedError {
+    case incomplete(reason: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .incomplete(let reason):
+            if reason == "max_output_tokens" {
+                return "The structured response reached its output-token limit and was incomplete."
+            }
+            return "The structured response was incomplete (\(reason))."
+        }
+    }
+}
+
+private struct StructuredResponseUsage: Decodable {
+    let inputTokens: Int?
+    let outputTokens: Int?
+    let totalTokens: Int?
+    let inputTokensDetails: StructuredInputTokenDetails?
+    let outputTokensDetails: StructuredOutputTokenDetails?
+
+    enum CodingKeys: String, CodingKey {
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case totalTokens = "total_tokens"
+        case inputTokensDetails = "input_tokens_details"
+        case outputTokensDetails = "output_tokens_details"
+    }
+}
+
+private struct StructuredInputTokenDetails: Decodable {
+    let cachedTokens: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case cachedTokens = "cached_tokens"
+    }
+}
+
+private struct StructuredOutputTokenDetails: Decodable {
+    let reasoningTokens: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case reasoningTokens = "reasoning_tokens"
     }
 }
 

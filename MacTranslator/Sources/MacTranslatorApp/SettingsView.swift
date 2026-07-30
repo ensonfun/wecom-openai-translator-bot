@@ -218,7 +218,7 @@ struct SettingsView: View {
                 }
 
             Label(
-                "Chat requests send only the current message. Learn separately analyzes new t/s records in small incremental batches.",
+                "Chat requests send only the current message. Learn separately analyzes new completed chat records in small incremental batches.",
                 systemImage: "lock.shield"
             )
             .font(.caption)
@@ -235,7 +235,7 @@ struct SettingsView: View {
                     systemImage: "externaldrive.fill"
                 )
                 Text(
-                    "The Learn page sends only new t/s turns and the current exercise context to OpenAI. It never sends the complete event archive."
+                    "The Learn page sends only new chat turns and a small set of recent, sanitized scenarios to generate a five-expression batch. The completed batch is graded in one request. It never sends the complete event archive."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)

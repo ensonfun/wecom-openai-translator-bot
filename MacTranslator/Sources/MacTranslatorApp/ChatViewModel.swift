@@ -12,8 +12,14 @@ extension Notification.Name {
 
 @MainActor
 final class ChatViewModel: ObservableObject {
+    static let visibleMessageLimit = 200
+
     @Published var input = ""
     @Published private(set) var messages: [ChatMessage] = []
+    @Published private(set) var totalMessageCount = 0
+    @Published private(set) var fullHistoryMessages: [ChatMessage] = []
+    @Published private(set) var isLoadingFullHistory = false
+    @Published private(set) var hasLoadedFullHistory = false
     @Published private(set) var isSending = false
     @Published private(set) var hasAPIKey = false
     @Published var errorMessage: String?
@@ -37,20 +43,22 @@ final class ChatViewModel: ObservableObject {
         self.client = client
         self.historyStore = historyStore
         self.diagnosticLogger = diagnosticLogger
-        migrateUnavailablePreviewModel()
 
         do {
-            messages = try historyStore.load()
+            totalMessageCount = try historyStore.messageCount()
+            messages = try historyStore.loadRecent(limit: Self.visibleMessageLimit)
             diagnosticLogger.event(
                 "chat_history_loaded",
                 component: "chat",
                 details: [
-                    "message_count": .integer(messages.count),
+                    "visible_message_count": .integer(messages.count),
+                    "total_message_count": .integer(totalMessageCount),
                     "database_path": .string(historyStore.databaseURL.path)
                 ]
             )
         } catch {
             messages = []
+            totalMessageCount = 0
             errorMessage = error.localizedDescription
             diagnosticLogger.event(
                 "chat_history_load_failed",
@@ -80,6 +88,14 @@ final class ChatViewModel: ObservableObject {
 
     var currentMode: CommandMode {
         CommandParser.parse(input).mode
+    }
+
+    var hasHistory: Bool {
+        totalMessageCount > 0
+    }
+
+    var hasOlderMessages: Bool {
+        totalMessageCount > messages.count
     }
 
     func refreshCredentials() {
@@ -146,8 +162,8 @@ final class ChatViewModel: ObservableObject {
             turnID: turnID,
             createdAt: createdAt
         )
-        messages.append(userMessage)
-        persistNewMessage(userMessage, position: messages.count - 1)
+        appendMessage(userMessage)
+        persistNewMessage(userMessage)
 
         let responseID = UUID()
         let responseMessage = ChatMessage(
@@ -158,8 +174,8 @@ final class ChatViewModel: ObservableObject {
             turnID: turnID,
             createdAt: createdAt
         )
-        messages.append(responseMessage)
-        persistNewMessage(responseMessage, position: messages.count - 1)
+        appendMessage(responseMessage)
+        persistNewMessage(responseMessage)
         let turn = ChatTurn(
             id: turnID,
             mode: command.mode,
@@ -253,12 +269,10 @@ final class ChatViewModel: ObservableObject {
                     )
                 ]
             )
-            if command.mode == .correct || command.mode == .slack {
-                NotificationCenter.default.post(
-                    name: .translatorChatHistoryDidChange,
-                    object: turnID
-                )
-            }
+            NotificationCenter.default.post(
+                name: .translatorChatHistoryDidChange,
+                object: turnID
+            )
             isSending = false
             requestTask = nil
         }
@@ -274,11 +288,15 @@ final class ChatViewModel: ObservableObject {
     }
 
     func clearConversation() {
-        let removedCount = messages.count
+        let removedCount = totalMessageCount
         requestTask?.cancel()
         requestTask = nil
         cancelPendingUpdates()
         messages.removeAll()
+        fullHistoryMessages.removeAll()
+        totalMessageCount = 0
+        hasLoadedFullHistory = false
+        isLoadingFullHistory = false
         errorMessage = nil
         isSending = false
         historyQueue.sync {
@@ -302,7 +320,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     func exportHistory() {
-        guard !messages.isEmpty else { return }
+        guard hasHistory else { return }
 
         flushHistory()
         let panel = NSSavePanel()
@@ -323,7 +341,7 @@ final class ChatViewModel: ObservableObject {
                 component: "chat",
                 details: [
                     "destination": .string(destinationURL.path),
-                    "message_count": .integer(messages.count)
+                    "message_count": .integer(totalMessageCount)
                 ]
             )
         } catch {
@@ -338,36 +356,83 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
+    func loadFullHistory(forceReload: Bool = false) {
+        guard !isLoadingFullHistory else { return }
+        guard forceReload || !hasLoadedFullHistory else { return }
+
+        flushHistory()
+        isLoadingFullHistory = true
+        let historyStore = historyStore
+        Task { [weak self] in
+            do {
+                let loaded = try await Task.detached(priority: .utility) {
+                    try historyStore.load()
+                }.value
+                guard let self else { return }
+
+                var merged = loaded
+                for visibleMessage in messages {
+                    if let index = merged.firstIndex(where: { $0.id == visibleMessage.id }) {
+                        merged[index] = visibleMessage
+                    } else {
+                        merged.append(visibleMessage)
+                    }
+                }
+                fullHistoryMessages = merged
+                totalMessageCount = merged.count
+                hasLoadedFullHistory = true
+                isLoadingFullHistory = false
+                diagnosticLogger.event(
+                    "chat_full_history_loaded",
+                    component: "chat",
+                    details: ["message_count": .integer(merged.count)]
+                )
+            } catch {
+                guard let self else { return }
+                isLoadingFullHistory = false
+                errorMessage = error.localizedDescription
+                diagnosticLogger.event(
+                    "chat_full_history_load_failed",
+                    level: .error,
+                    component: "chat",
+                    failure: DiagnosticFailure.from(error)
+                )
+            }
+        }
+    }
+
     private func resolvedAPIKey() -> String? {
         SharedOpenAIConfiguration.apiKey(from: keychain)
     }
 
-    private func migrateUnavailablePreviewModel() {
-        let defaults = UserDefaults.standard
-        let configuredModel = defaults.string(forKey: AppSettings.modelKey)
-        let resolvedModel = AppSettings.resolvedModel(configuredModel)
-        if configuredModel != nil, configuredModel != resolvedModel {
-            defaults.set(resolvedModel, forKey: AppSettings.modelKey)
-            diagnosticLogger.event(
-                "model_setting_migrated",
-                component: "settings",
-                details: [
-                    "previous_model": .string(configuredModel ?? ""),
-                    "resolved_model": .string(resolvedModel)
-                ]
-            )
+    private func appendMessage(_ message: ChatMessage) {
+        messages.append(message)
+        if messages.count > Self.visibleMessageLimit {
+            messages.removeFirst(messages.count - Self.visibleMessageLimit)
+        }
+        totalMessageCount += 1
+        if hasLoadedFullHistory {
+            fullHistoryMessages.append(message)
         }
     }
 
     private func append(_ delta: String, to id: UUID) {
         guard let index = messages.firstIndex(where: { $0.id == id }) else { return }
         messages[index].text += delta
+        if hasLoadedFullHistory,
+           let fullIndex = fullHistoryMessages.firstIndex(where: { $0.id == id }) {
+            fullHistoryMessages[fullIndex].text = messages[index].text
+        }
         persistTextDebounced(id: id, text: messages[index].text)
     }
 
     private func replaceMessage(id: UUID, with text: String) {
         guard let index = messages.firstIndex(where: { $0.id == id }) else { return }
         messages[index].text = text
+        if hasLoadedFullHistory,
+           let fullIndex = fullHistoryMessages.firstIndex(where: { $0.id == id }) {
+            fullHistoryMessages[fullIndex].text = text
+        }
         persistTextDebounced(id: id, text: text)
     }
 
@@ -380,6 +445,10 @@ final class ChatViewModel: ObservableObject {
         pendingTextUpdates[id]?.cancel()
         pendingTextUpdates[id] = nil
         messages.remove(at: index)
+        totalMessageCount = max(0, totalMessageCount - 1)
+        if hasLoadedFullHistory {
+            fullHistoryMessages.removeAll { $0.id == id }
+        }
         historyQueue.async { [historyStore, diagnosticLogger] in
             do {
                 try historyStore.delete(id: id)
@@ -395,10 +464,10 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    private func persistNewMessage(_ message: ChatMessage, position: Int) {
+    private func persistNewMessage(_ message: ChatMessage) {
         historyQueue.async { [historyStore, diagnosticLogger] in
             do {
-                try historyStore.upsert(message, position: position)
+                try historyStore.append(message)
             } catch {
                 diagnosticLogger.event(
                     "chat_message_insert_failed",
@@ -409,7 +478,6 @@ final class ChatViewModel: ObservableObject {
                     details: [
                         "message_id": .string(message.id.uuidString),
                         "role": .string(message.role.rawValue),
-                        "position": .integer(position),
                         "text": .string(message.text)
                     ]
                 )
@@ -478,7 +546,7 @@ final class ChatViewModel: ObservableObject {
             let message = messages[index]
             historyQueue.sync {
                 do {
-                    try historyStore.upsert(message, position: index)
+                    try historyStore.updateText(id: message.id, text: message.text)
                 } catch {
                     diagnosticLogger.event(
                         "chat_message_final_persist_failed",
@@ -522,11 +590,16 @@ final class ChatViewModel: ObservableObject {
         let snapshot = messages
         historyQueue.sync {
             do {
-                try historyStore.replaceAll(snapshot)
+                for message in snapshot {
+                    try historyStore.updateText(id: message.id, text: message.text)
+                }
                 diagnosticLogger.event(
                     "chat_history_flushed",
                     component: "storage",
-                    details: ["message_count": .integer(snapshot.count)]
+                    details: [
+                        "visible_message_count": .integer(snapshot.count),
+                        "total_message_count": .integer(totalMessageCount)
+                    ]
                 )
             } catch {
                 diagnosticLogger.event(
@@ -534,7 +607,10 @@ final class ChatViewModel: ObservableObject {
                     level: .error,
                     component: "storage",
                     failure: DiagnosticFailure.from(error),
-                    details: ["message_count": .integer(snapshot.count)]
+                    details: [
+                        "visible_message_count": .integer(snapshot.count),
+                        "total_message_count": .integer(totalMessageCount)
+                    ]
                 )
             }
         }

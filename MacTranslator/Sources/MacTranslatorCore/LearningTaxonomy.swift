@@ -16,6 +16,10 @@ public enum LearningDimension: String, Codable, CaseIterable, Sendable {
         case .mechanics: "Writing mechanics"
         }
     }
+
+    public var isTrainable: Bool {
+        self != .mechanics
+    }
 }
 
 public struct KnowledgePointDefinition: Identifiable, Codable, Equatable, Sendable {
@@ -81,6 +85,18 @@ public enum LearningTaxonomy {
 
     public static var ids: [String] {
         all.map(\.id)
+    }
+
+    public static var trainable: [KnowledgePointDefinition] {
+        all.filter { $0.dimension.isTrainable }
+    }
+
+    public static var trainableIDs: [String] {
+        trainable.map(\.id)
+    }
+
+    public static func isTrainable(_ id: String) -> Bool {
+        definition(for: id)?.dimension.isTrainable == true
     }
 
     private static let definitionsByID = Dictionary(
