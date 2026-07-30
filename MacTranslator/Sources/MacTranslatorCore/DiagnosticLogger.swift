@@ -353,6 +353,7 @@ public final class DiagnosticLogger: @unchecked Sendable {
         receivedText: Bool,
         durationMilliseconds: Int,
         outputText: String? = nil,
+        tokenUsage: LearningTokenUsage? = nil,
         context: DiagnosticRequestContext = DiagnosticRequestContext(flow: "openai")
     ) {
         var details = context.details
@@ -364,6 +365,21 @@ public final class DiagnosticLogger: @unchecked Sendable {
         if let outputText {
             details["output"] = .string(outputText)
             details["output_chars"] = .integer(outputText.count)
+        }
+        if let inputTokens = tokenUsage?.inputTokens {
+            details["input_tokens"] = .integer(inputTokens)
+        }
+        if let outputTokens = tokenUsage?.outputTokens {
+            details["output_tokens"] = .integer(outputTokens)
+        }
+        if let totalTokens = tokenUsage?.totalTokens {
+            details["total_tokens"] = .integer(totalTokens)
+        }
+        if let cachedInputTokens = tokenUsage?.cachedInputTokens {
+            details["cached_input_tokens"] = .integer(cachedInputTokens)
+        }
+        if let reasoningOutputTokens = tokenUsage?.reasoningOutputTokens {
+            details["reasoning_output_tokens"] = .integer(reasoningOutputTokens)
         }
         event(
             "request_completed",

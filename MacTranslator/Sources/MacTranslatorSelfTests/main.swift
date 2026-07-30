@@ -20,6 +20,7 @@ final class OpenAIStubURLProtocol: URLProtocol {
         case success(String)
         case partialTextThenConnectionLost(String)
         case structuredSuccess(String)
+        case structuredIncomplete(String, reason: String)
     }
 
     private static let lock = NSLock()
@@ -77,6 +78,12 @@ final class OpenAIStubURLProtocol: URLProtocol {
             }
         case .structuredSuccess(let json):
             sendJSONResponse(outputText: json)
+        case .structuredIncomplete(let json, let reason):
+            sendJSONResponse(
+                outputText: json,
+                status: "incomplete",
+                incompleteReason: reason
+            )
         }
     }
 
@@ -120,22 +127,47 @@ final class OpenAIStubURLProtocol: URLProtocol {
         return data.isEmpty ? nil : data
     }
 
-    private func sendJSONResponse(outputText: String) {
+    private func sendJSONResponse(
+        outputText: String,
+        status: String = "completed",
+        incompleteReason: String? = nil
+    ) {
         let encodedText = try! JSONEncoder().encode(outputText)
         let text = String(decoding: encodedText, as: UTF8.self)
+        let encodedStatus = try! JSONEncoder().encode(status)
+        let statusText = String(decoding: encodedStatus, as: UTF8.self)
+        let incompleteDetails: String
+        if let incompleteReason {
+            let encodedReason = try! JSONEncoder().encode(incompleteReason)
+            let reasonText = String(decoding: encodedReason, as: UTF8.self)
+            incompleteDetails = #"{"reason":\#(reasonText)}"#
+        } else {
+            incompleteDetails = "null"
+        }
         let body = Data(
             """
             {
-              "status": "completed",
+              "status": \(statusText),
               "error": null,
-              "incomplete_details": null,
+              "incomplete_details": \(incompleteDetails),
               "output": [{
                 "type": "message",
                 "content": [{
                   "type": "output_text",
                   "text": \(text)
                 }]
-              }]
+              }],
+              "usage": {
+                "input_tokens": 111,
+                "input_tokens_details": {
+                  "cached_tokens": 11
+                },
+                "output_tokens": 37,
+                "output_tokens_details": {
+                  "reasoning_tokens": 7
+                },
+                "total_tokens": 148
+              }
             }
             """.utf8
         )
@@ -305,12 +337,16 @@ do {
 }
 
 expect(
-    AppSettings.resolvedModel("gpt-5.6-luna") == "gpt-5.5",
-    "不可用的 gpt-5.6-luna 设置会迁移到 gpt-5.5"
+    AppSettings.resolvedModel("gpt-5.6-luna") == "gpt-5.6-luna",
+    "自定义模型名不会被自动迁移"
 )
 expect(
     AppSettings.resolvedModel("gpt-5.4-mini") == "gpt-5.4-mini",
     "其他自定义模型设置保持不变"
+)
+expect(
+    AppSettings.resolvedModel("  custom-model  ") == "custom-model",
+    "自定义模型名只会移除首尾空白"
 )
 expect(
     KeychainError.from(status: errSecAuthFailed).requiresLoginKeychainReconnect,
@@ -320,6 +356,106 @@ expect(
     !KeychainError.from(status: errSecParam).requiresLoginKeychainReconnect,
     "普通 Keychain 参数错误不会误触发重新连接"
 )
+expect(
+    !LearningTaxonomy.trainableIDs.contains("mechanics.spelling")
+        && !LearningTaxonomy.trainableIDs.contains("mechanics.capitalization")
+        && !LearningTaxonomy.trainableIDs.contains("mechanics.punctuation"),
+    "拼写、大小写和标点不会进入可训练知识点"
+)
+expect(
+    LearningPromptContracts.answerGrader.contains("all punctuation differences")
+        && LearningPromptContracts.answerGrader.contains(
+            "including missing or incorrect punctuation"
+        ),
+    "V2 判题会完全忽略标点问题"
+)
+expect(
+    LearningEngine.expressionBatchSize == 5,
+    "Learn 默认每批生成五道表达题"
+)
+expect(
+    LearningEngine.batchOutcome(successfulCount: 4, completedBatchCount: 1) == .passed,
+    "一批达到 4/5 只结束当天强化"
+)
+expect(
+    LearningEngine.batchOutcome(successfulCount: 3, completedBatchCount: 1) == .reinforce,
+    "一批低于 4/5 会继续相同知识点"
+)
+expect(
+    LearningEngine.batchOutcome(successfulCount: 2, completedBatchCount: 3) == .paused,
+    "连续三轮仍未通过时会暂停到次日而不是无限刷题"
+)
+expect(
+    !LearningEngine.shouldIntroduceNewMaterial(
+        reviewSessionsToday: 1,
+        newMaterialSessionsToday: 0,
+        hasNewMaterial: true
+    )
+        && LearningEngine.shouldIntroduceNewMaterial(
+            reviewSessionsToday: 2,
+            newMaterialSessionsToday: 0,
+            hasNewMaterial: true
+        ),
+    "每日计划按约两轮旧知识复习搭配一轮新内容"
+)
+expect(
+    !LearningEngine.shouldAutomaticallySync(pendingTurnCount: 49),
+    "未分析 Chat 少于 50 条时不会自动调用 Learn"
+)
+expect(
+    LearningEngine.shouldAutomaticallySync(pendingTurnCount: 50),
+    "未分析 Chat 达到 50 条时才会自动调用 Learn"
+)
+
+do {
+    let questionSchemaData = try JSONEncoder().encode(
+        LearningPromptContracts.questionBatchSchema
+    )
+    let questionSchemaText = String(decoding: questionSchemaData, as: UTF8.self)
+    expect(
+        questionSchemaText.contains("chinese_to_english")
+            && questionSchemaText.contains("questions")
+            && !questionSchemaText.contains("fill_blank")
+            && !questionSchemaText.contains("sentence_repair"),
+        "V3 批量出题 Schema 只允许中文到英文表达"
+    )
+    let gradeSchemaText = String(
+        decoding: try JSONEncoder().encode(LearningPromptContracts.gradeBatchSchema),
+        as: UTF8.self
+    )
+    expect(
+        gradeSchemaText.contains("patterns")
+            && gradeSchemaText.contains("key_explanations_zh")
+            && gradeSchemaText.contains("question_id")
+            && gradeSchemaText.contains("grades"),
+        "V3 批量判题 Schema 强制返回常见句式和重点讲解"
+    )
+    let constrainedHistorySchemaText = String(
+        decoding: try JSONEncoder().encode(
+            LearningPromptContracts.historyAnalysisSchema(turnIDs: ["t1", "t2"])
+        ),
+        as: UTF8.self
+    )
+    expect(
+        constrainedHistorySchemaText.contains(#""enum":["t1","t2"]"#)
+            || constrainedHistorySchemaText.contains(#""enum":["t2","t1"]"#),
+        "历史分析 Schema 只允许回传本批短 turn ID"
+    )
+    let constrainedGradeSchemaText = String(
+        decoding: try JSONEncoder().encode(
+            LearningPromptContracts.gradeBatchSchema(questionIDs: ["q1", "q2"])
+        ),
+        as: UTF8.self
+    )
+    expect(
+        constrainedGradeSchemaText.contains(#""enum":["q1","q2"]"#)
+            || constrainedGradeSchemaText.contains(#""enum":["q2","q1"]"#),
+        "批量判题 Schema 只允许回传本批短 question ID"
+    )
+} catch {
+    failures += 1
+    print("✗ V2 学习 Schema 自检出错：\(error.localizedDescription)")
+}
 
 let multilineMarkdown = "**Option 1:**\nFirst line\n**Option 2:**\nSecond line"
 let formattedMarkdown = MessageTextFormatter.format(multilineMarkdown)
@@ -401,9 +537,52 @@ do {
     expect(messagesAfterUpdate[1].text == updatedText, "流式响应只更新当前消息行")
 
     let thirdMessage = ChatMessage(role: .user, text: "S hello", mode: .slack)
-    try historyStore.upsert(thirdMessage, position: 2)
+    try historyStore.append(thirdMessage)
     let messagesAfterInsert = try historyStore.load()
     expect(messagesAfterInsert.count == 3, "可以增量插入单条消息")
+    let insertedMessageCount = try historyStore.messageCount()
+    let twoMostRecentMessages = try historyStore.loadRecent(limit: 2)
+    expect(insertedMessageCount == 3, "可以不加载正文就统计全部聊天记录")
+    expect(
+        twoMostRecentMessages.map(\.id) == [savedMessages[1].id, thirdMessage.id],
+        "主聊天页可以只读取最近的消息并保持时间顺序"
+    )
+
+    let recentHistoryStore = ChatHistoryStore(
+        directoryURL: testDirectory.appendingPathComponent("RecentHistory", isDirectory: true)
+    )
+    let longHistory = (0..<205).map { index in
+        ChatMessage(
+            role: index.isMultiple(of: 2) ? .user : .assistant,
+            text: "history-\(index)",
+            mode: .translate,
+            createdAt: Date(timeIntervalSince1970: Double(index + 1))
+        )
+    }
+    try recentHistoryStore.replaceAll(longHistory)
+    let visibleHistory = try recentHistoryStore.loadRecent(limit: 200)
+    let longHistoryCount = try recentHistoryStore.messageCount()
+    expect(
+        longHistoryCount == 205
+            && visibleHistory.count == 200
+            && visibleHistory.first?.text == "history-5"
+            && visibleHistory.last?.text == "history-204",
+        "超过 200 条时主页面只读取最近 200 条"
+    )
+    let appendedHistoryMessage = ChatMessage(
+        role: .user,
+        text: "history-205",
+        mode: .translate
+    )
+    try recentHistoryStore.append(appendedHistoryMessage)
+    let historyAfterAppend = try recentHistoryStore.loadRecent(limit: 200)
+    let appendedHistoryCount = try recentHistoryStore.messageCount()
+    expect(
+        appendedHistoryCount == 206
+            && historyAfterAppend.first?.text == "history-6"
+            && historyAfterAppend.last?.id == appendedHistoryMessage.id,
+        "新消息会追加到完整历史且最近 200 条窗口向前滚动"
+    )
 
     let turnID = UUID()
     let turnDate = Date(timeIntervalSince1970: 1_725_000_000)
@@ -439,11 +618,19 @@ do {
     let learningTurns = try historyStore.learningSourceTurns()
     expect(
         learningTurns.contains {
+            $0.mode == .translate
+                && $0.userText == savedMessages[0].text
+                && $0.assistantText == updatedText
+        },
+        "所有对话模式都可以提供个性化出题场景"
+    )
+    expect(
+        learningTurns.contains {
             $0.id == turnID
                 && $0.userText == learningUser.text
                 && $0.assistantText == learningAssistant.text
         },
-        "t/s 消息会按稳定 turn ID 组成学习数据源"
+        "英文纠正消息会按稳定 turn ID 组成学习数据源"
     )
 
     let exportURL = testDirectory.appendingPathComponent("export.json")
@@ -462,6 +649,100 @@ do {
 } catch {
     failures += 1
     print("✗ 聊天记录持久化自检出错：\(error.localizedDescription)")
+}
+
+let syncThresholdDirectory = FileManager.default.temporaryDirectory
+    .appendingPathComponent(
+        "MacTranslatorSyncThreshold-\(UUID().uuidString)",
+        isDirectory: true
+    )
+defer { try? FileManager.default.removeItem(at: syncThresholdDirectory) }
+
+do {
+    let thresholdLogger = DiagnosticLogger(
+        directoryURL: syncThresholdDirectory.appendingPathComponent(
+            "logs",
+            isDirectory: true
+        )
+    )
+    let thresholdHistoryStore = ChatHistoryStore(
+        directoryURL: syncThresholdDirectory
+    )
+    let thresholdLearningStore = LearningStore(
+        directoryURL: syncThresholdDirectory,
+        diagnosticLogger: thresholdLogger
+    )
+    var firstTurnID: UUID?
+    for index in 0..<LearningEngine.automaticHistorySyncThreshold {
+        let turnID = UUID()
+        firstTurnID = firstTurnID ?? turnID
+        let timestamp = Date(timeIntervalSince1970: 1_730_000_000 + Double(index))
+        let user = ChatMessage(
+            role: .user,
+            text: "Test message \(index)",
+            mode: .slack,
+            turnID: turnID,
+            createdAt: timestamp
+        )
+        let assistant = ChatMessage(
+            role: .assistant,
+            text: "Rewritten test message \(index)",
+            mode: .slack,
+            turnID: turnID,
+            createdAt: timestamp
+        )
+        try thresholdHistoryStore.upsert(user, position: index * 2)
+        try thresholdHistoryStore.upsert(assistant, position: index * 2 + 1)
+        try thresholdHistoryStore.upsertTurn(
+            ChatTurn(
+                id: turnID,
+                mode: .slack,
+                userMessageID: user.id,
+                assistantMessageID: assistant.id,
+                createdAt: timestamp,
+                completedAt: timestamp,
+                status: .completed,
+                model: "self-test-model",
+                promptFingerprint: "self-test"
+            )
+        )
+    }
+    let thresholdEngine = LearningEngine(
+        historyStore: thresholdHistoryStore,
+        learningStore: thresholdLearningStore,
+        diagnosticLogger: thresholdLogger
+    )
+    let pendingAtThreshold = try await thresholdEngine.pendingHistoryTurnCount()
+    expect(
+        pendingAtThreshold == LearningEngine.automaticHistorySyncThreshold,
+        "自动同步阈值按未分析的已完成 Chat turn 计算"
+    )
+
+    if let firstTurnID {
+        try thresholdLearningStore.append(
+            PendingLearningEvent(
+                type: .sourceTurnAnalysisCompleted,
+                sourceTurnID: firstTurnID,
+                idempotencyKey: "threshold-first-turn-analyzed",
+                producer: "self_test",
+                payload: SourceTurnAnalysisCompletedPayload(
+                    sourceTurnID: firstTurnID,
+                    inputLanguage: .english,
+                    isProficiencyEvidence: true,
+                    analyzerVersion: LearningPromptContracts.analyzerVersion,
+                    evidenceCount: 0
+                )
+            )
+        )
+    }
+    let pendingAfterOneAnalyzed = try await thresholdEngine.pendingHistoryTurnCount()
+    expect(
+        pendingAfterOneAnalyzed == LearningEngine.automaticHistorySyncThreshold - 1,
+        "已分析的 Chat 不会重复计入 50 条阈值"
+    )
+} catch {
+    failures += 1
+    print("✗ Learn 自动同步阈值自检出错：\(error.localizedDescription)")
 }
 
 let learningTestDirectory = FileManager.default.temporaryDirectory
@@ -584,8 +865,39 @@ do {
         explanationZH: "went 正确表达过去发生的动作。",
         issues: [],
         followUp: .variation,
-        gradedAt: observedAt.addingTimeInterval(30)
+        gradedAt: observedAt.addingTimeInterval(30),
+        alternativeAnswers: ["She returned home yesterday."],
+        patterns: [
+            LearningSentencePattern(
+                pattern: "subject + past-tense verb + time",
+                meaningZH: "用一般过去时说明已发生的动作",
+                example: "The deployment finished yesterday."
+            )
+        ],
+        keyExplanationsZH: ["明确的过去时间通常需要一般过去时。"]
     )
+    do {
+        let encodedGrade = try JSONEncoder().encode(grade)
+        guard var legacyObject = try JSONSerialization.jsonObject(
+            with: encodedGrade
+        ) as? [String: Any] else {
+            throw LearningStoreError.invalidPayload
+        }
+        legacyObject.removeValue(forKey: "alternativeAnswers")
+        legacyObject.removeValue(forKey: "patterns")
+        legacyObject.removeValue(forKey: "keyExplanationsZH")
+        let legacyData = try JSONSerialization.data(withJSONObject: legacyObject)
+        let decodedLegacyGrade = try JSONDecoder().decode(
+            AnswerGradedPayload.self,
+            from: legacyData
+        )
+        expect(
+            decodedLegacyGrade.patterns.isEmpty
+                && decodedLegacyGrade.keyExplanationsZH.isEmpty
+                && decodedLegacyGrade.countsTowardMastery,
+            "旧判题事件缺少 V2 反馈字段时仍可解码"
+        )
+    }
     try learningStore.append([
         try PendingLearningEvent(
             type: .learningSessionStarted,
@@ -647,6 +959,15 @@ do {
         "答案、判题和讲解状态可以从事件重建"
     )
     expect(
+        learningDashboard.activeSession?.attempts.last?.question.batchID == nil,
+        "升级前没有 batch ID 的旧题目事件仍可重建"
+    )
+    expect(
+        learningDashboard.activeSession?.attempts.last?.grade?.patterns.first?.pattern
+            == "subject + past-tense verb + time",
+        "常见句式和重点讲解会随判题事件持久化"
+    )
+    expect(
         learningDashboard.knowledgePoints.first {
             $0.id == "grammar.tense_aspect"
         }?.successfulAttempts == 1,
@@ -678,6 +999,177 @@ do {
     print("✗ 事件驱动学习存储自检出错：\(error.localizedDescription)")
 }
 
+let spacedReviewDirectory = FileManager.default.temporaryDirectory
+    .appendingPathComponent(
+        "MacTranslatorSpacedReview-\(UUID().uuidString)",
+        isDirectory: true
+    )
+defer { try? FileManager.default.removeItem(at: spacedReviewDirectory) }
+
+do {
+    let spacedReviewStore = LearningStore(
+        directoryURL: spacedReviewDirectory,
+        diagnosticLogger: DiagnosticLogger(
+            directoryURL: spacedReviewDirectory.appendingPathComponent(
+                "logs",
+                isDirectory: true
+            )
+        )
+    )
+    let knowledgePointID = "vocabulary.collocation"
+    let firstSessionID = UUID()
+    let firstReviewAt = Date(timeIntervalSince1970: 1_750_000_000)
+    try spacedReviewStore.append([
+        try PendingLearningEvent(
+            type: .learningSessionStarted,
+            occurredAt: firstReviewAt,
+            sessionID: firstSessionID,
+            idempotencyKey: "spaced-session-start",
+            producer: "self_test",
+            payload: LearningSessionStartedPayload(
+                sessionID: firstSessionID,
+                startedAt: firstReviewAt
+            )
+        ),
+        try PendingLearningEvent(
+            type: .sessionFocusSelected,
+            occurredAt: firstReviewAt,
+            sessionID: firstSessionID,
+            knowledgePointID: knowledgePointID,
+            idempotencyKey: "spaced-session-focus",
+            producer: "self_test",
+            payload: SessionFocusSelectedPayload(
+                sessionID: firstSessionID,
+                knowledgePointID: knowledgePointID,
+                title: "Collocation",
+                reason: "New from recent chats.",
+                planKind: .newMaterial
+            )
+        ),
+        try PendingLearningEvent(
+            type: .batchReviewCompleted,
+            occurredAt: firstReviewAt,
+            sessionID: firstSessionID,
+            knowledgePointID: knowledgePointID,
+            idempotencyKey: "spaced-first-pass",
+            producer: "self_test",
+            payload: BatchReviewCompletedPayload(
+                sessionID: firstSessionID,
+                batchID: UUID(),
+                knowledgePointID: knowledgePointID,
+                successfulCount: 4,
+                questionCount: 5,
+                reinforcementRound: 1,
+                outcome: .passed,
+                completedAt: firstReviewAt
+            )
+        )
+    ])
+    var spacedKnowledge = try spacedReviewStore.dashboard().knowledgePoints.first {
+        $0.id == knowledgePointID
+    }
+    expect(
+        spacedKnowledge?.reviewStage == 0
+            && spacedKnowledge?.successfulReviewCount == 1,
+        "当天首次 4/5 只建立复习计划，不会直接推进长期记忆阶段"
+    )
+
+    let sameDayReviewAt = firstReviewAt.addingTimeInterval(60 * 60)
+    try spacedReviewStore.append(
+        PendingLearningEvent(
+            type: .batchReviewCompleted,
+            occurredAt: sameDayReviewAt,
+            sessionID: firstSessionID,
+            knowledgePointID: knowledgePointID,
+            idempotencyKey: "spaced-same-day-pass",
+            producer: "self_test",
+            payload: BatchReviewCompletedPayload(
+                sessionID: firstSessionID,
+                batchID: UUID(),
+                knowledgePointID: knowledgePointID,
+                successfulCount: 5,
+                questionCount: 5,
+                reinforcementRound: 2,
+                outcome: .passed,
+                completedAt: sameDayReviewAt
+            )
+        )
+    )
+    spacedKnowledge = try spacedReviewStore.dashboard().knowledgePoints.first {
+        $0.id == knowledgePointID
+    }
+    expect(
+        spacedKnowledge?.reviewStage == 0,
+        "同一天重复答对不会推进间隔阶段"
+    )
+
+    guard let firstDueAt = spacedKnowledge?.dueAt else {
+        throw LearningStoreError.invalidPayload
+    }
+    let delayedReviewAt = firstDueAt.addingTimeInterval(60)
+    let secondSessionID = UUID()
+    try spacedReviewStore.append(
+        PendingLearningEvent(
+            type: .batchReviewCompleted,
+            occurredAt: delayedReviewAt,
+            sessionID: secondSessionID,
+            knowledgePointID: knowledgePointID,
+            idempotencyKey: "spaced-delayed-pass",
+            producer: "self_test",
+            payload: BatchReviewCompletedPayload(
+                sessionID: secondSessionID,
+                batchID: UUID(),
+                knowledgePointID: knowledgePointID,
+                successfulCount: 4,
+                questionCount: 5,
+                reinforcementRound: 1,
+                outcome: .passed,
+                completedAt: delayedReviewAt
+            )
+        )
+    )
+    spacedKnowledge = try spacedReviewStore.dashboard().knowledgePoints.first {
+        $0.id == knowledgePointID
+    }
+    expect(
+        spacedKnowledge?.reviewStage == 1,
+        "跨天且到期后的成功复习最多推进一个间隔阶段"
+    )
+
+    let lapseAt = (spacedKnowledge?.dueAt ?? delayedReviewAt).addingTimeInterval(60)
+    try spacedReviewStore.append(
+        PendingLearningEvent(
+            type: .batchReviewCompleted,
+            occurredAt: lapseAt,
+            sessionID: UUID(),
+            knowledgePointID: knowledgePointID,
+            idempotencyKey: "spaced-lapse",
+            producer: "self_test",
+            payload: BatchReviewCompletedPayload(
+                sessionID: UUID(),
+                batchID: UUID(),
+                knowledgePointID: knowledgePointID,
+                successfulCount: 2,
+                questionCount: 5,
+                reinforcementRound: 1,
+                outcome: .reinforce,
+                completedAt: lapseAt
+            )
+        )
+    )
+    spacedKnowledge = try spacedReviewStore.dashboard().knowledgePoints.first {
+        $0.id == knowledgePointID
+    }
+    expect(
+        spacedKnowledge?.reviewStage == 0
+            && spacedKnowledge?.lifecycle == .lapsed,
+        "到期复习低于 3/5 会重置短间隔并标记为遗忘"
+    )
+} catch {
+    failures += 1
+    print("✗ 批次级间隔复习自检出错：\(error.localizedDescription)")
+}
+
 expect(
     OpenAIClient.isRetryable(URLError(.networkConnectionLost)),
     "连接中断属于可重试错误"
@@ -707,10 +1199,12 @@ let stubConfiguration = URLSessionConfiguration.ephemeral
 stubConfiguration.protocolClasses = [OpenAIStubURLProtocol.self]
 let stubSession = URLSession(configuration: stubConfiguration)
 defer { stubSession.invalidateAndCancel() }
+let learningDebugStore = LearningDebugStore(maxEntries: 10)
 let retryClient = OpenAIClient(
     endpoint: URL(string: "https://self-test.invalid/v1/responses")!,
     session: stubSession,
     diagnosticLogger: retryLogger,
+    learningDebugStore: learningDebugStore,
     retryDelayNanoseconds: [0, 0]
 )
 let secretAPIKey = "sk-self-test-must-not-appear"
@@ -728,7 +1222,8 @@ do {
         schemaName: "self_test",
         schema: .strictObject(properties: [
             "value": .object(["type": .string("string")])
-        ])
+        ]),
+        diagnosticContext: DiagnosticRequestContext(flow: "learning_self_test")
     )
     expect(structured.value == "schema matched", "Responses API 结构化输出可以解码为 Swift 类型")
 
@@ -739,10 +1234,134 @@ do {
     let formatObject = textObject?["format"] as? [String: Any]
     expect(formatObject?["type"] as? String == "json_schema", "结构化请求使用 text.format JSON Schema")
     expect(requestObject?["store"] as? Bool == false, "学习请求明确关闭服务端响应存储")
+
+    let debugEntry = learningDebugStore.entries().first
+    expect(debugEntry?.instructions == "Return structured JSON.", "Learn Debug 记录输入 prompt")
+    expect(debugEntry?.input == secretChatText, "Learn Debug 记录请求 input")
+    expect(debugEntry?.response == #"{"value":"schema matched"}"#, "Learn Debug 记录 LLM response")
+    expect(debugEntry?.tokenUsage?.inputTokens == 111, "Learn Debug 记录 input token 用量")
+    expect(debugEntry?.tokenUsage?.outputTokens == 37, "Learn Debug 记录 output token 用量")
+    expect(debugEntry?.tokenUsage?.totalTokens == 148, "Learn Debug 记录 total token 用量")
+    expect(debugEntry?.tokenUsage?.cachedInputTokens == 11, "Learn Debug 记录 cached token 用量")
+    expect(debugEntry?.tokenUsage?.reasoningOutputTokens == 7, "Learn Debug 记录 reasoning token 用量")
 } catch {
     failures += 1
     print("✗ 结构化输出自检出错：\(error.localizedDescription)")
 }
+
+do {
+    OpenAIStubURLProtocol.configure([
+        .structuredSuccess(#"{"wrong":"first response cannot decode"}"#),
+        .structuredSuccess(#"{"value":"recovered after decode retry"}"#)
+    ])
+    let structured: StructuredSelfTestOutput = try await retryClient.structuredResponse(
+        apiKey: secretAPIKey,
+        model: "self-test-model",
+        instructions: "Return structured JSON.",
+        input: secretChatText,
+        schemaName: "decode_retry_self_test",
+        schema: .strictObject(properties: [
+            "value": .object(["type": .string("string")])
+        ]),
+        diagnosticContext: DiagnosticRequestContext(flow: "learning_decode_retry")
+    )
+    expect(
+        structured.value == "recovered after decode retry",
+        "结构化内容解码失败后会自动紧凑重试一次"
+    )
+    expect(OpenAIStubURLProtocol.requestCount == 2, "结构化解码重试最多额外请求一次")
+    let retryRequest = OpenAIStubURLProtocol.lastRequestBody.flatMap {
+        try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+    }
+    expect(
+        (retryRequest?["instructions"] as? String)?.contains(
+            "Do not pad any field with spaces"
+        ) == true,
+        "结构化内容重试会要求模型返回紧凑完整 JSON"
+    )
+    let retryEntries = learningDebugStore.entries().filter {
+        $0.flow == "learning_decode_retry"
+    }
+    expect(
+        retryEntries.count == 2
+            && retryEntries.contains(where: {
+                $0.status == .failed
+                    && $0.errorMessage?.contains("missing required field 'value'") == true
+            }),
+        "Learn Debug 会保留首次解码失败的具体字段"
+    )
+} catch {
+    failures += 1
+    print("✗ 结构化解码重试自检出错：\(error.localizedDescription)")
+}
+
+do {
+    OpenAIStubURLProtocol.configure([
+        .structuredIncomplete(#"{"value":"truncated""#, reason: "max_output_tokens"),
+        .structuredSuccess(#"{"value":"recovered after truncation"}"#)
+    ])
+    let structured: StructuredSelfTestOutput = try await retryClient.structuredResponse(
+        apiKey: secretAPIKey,
+        model: "self-test-model",
+        instructions: "Return structured JSON.",
+        input: secretChatText,
+        schemaName: "incomplete_retry_self_test",
+        schema: .strictObject(properties: [
+            "value": .object(["type": .string("string")])
+        ]),
+        diagnosticContext: DiagnosticRequestContext(flow: "learning_incomplete_retry")
+    )
+    expect(
+        structured.value == "recovered after truncation",
+        "达到输出 token 上限的结构化响应不会解码，并会自动重试"
+    )
+    expect(OpenAIStubURLProtocol.requestCount == 2, "截断响应只触发一次内容重试")
+    let incompleteEntry = learningDebugStore.entries().first {
+        $0.flow == "learning_incomplete_retry" && $0.status == .failed
+    }
+    expect(
+        incompleteEntry?.response == #"{"value":"truncated""#,
+        "Learn Debug 保留截断时的模型原始输出"
+    )
+    expect(
+        incompleteEntry?.tokenUsage?.totalTokens == 148,
+        "Learn Debug 在截断失败时仍保留 token 用量"
+    )
+    expect(
+        incompleteEntry?.errorMessage?.contains("output-token limit") == true,
+        "Learn Debug 明确显示结构化响应因 token 上限而截断"
+    )
+} catch {
+    failures += 1
+    print("✗ 结构化截断重试自检出错：\(error.localizedDescription)")
+}
+
+OpenAIStubURLProtocol.configure([
+    .structuredSuccess(#"{"wrong":"first"}"#),
+    .structuredSuccess(#"{"wrong":"second"}"#)
+])
+var finalStructuredError = ""
+do {
+    let _: StructuredSelfTestOutput = try await retryClient.structuredResponse(
+        apiKey: secretAPIKey,
+        model: "self-test-model",
+        instructions: "Return structured JSON.",
+        input: secretChatText,
+        schemaName: "decode_failure_self_test",
+        schema: .strictObject(properties: [
+            "value": .object(["type": .string("string")])
+        ]),
+        diagnosticContext: DiagnosticRequestContext(flow: "learning_decode_failure")
+    )
+} catch {
+    finalStructuredError = error.localizedDescription
+}
+expect(
+    finalStructuredError.contains("missing required field 'value'")
+        && finalStructuredError.contains("retried once"),
+    "两次结构化解码失败后会显示具体字段和已重试信息"
+)
+expect(OpenAIStubURLProtocol.requestCount == 2, "内容无效时不会无限重试")
 
 do {
     OpenAIStubURLProtocol.configure([
@@ -819,6 +1438,7 @@ expect(diagnosticText.contains("private instructions must not appear"), "诊断�
 expect(diagnosticText.contains("Recovered"), "诊断日志记录完整模型输出")
 expect(diagnosticText.contains("Partial"), "诊断日志记录失败前的部分模型输出")
 expect(diagnosticText.contains("self-test-model"), "诊断日志记录请求模型")
+expect(diagnosticText.contains("\"total_tokens\":148"), "诊断日志记录 token 用量")
 expect(diagnosticText.contains("response_received"), "诊断日志记录 HTTP 响应阶段")
 expect(diagnosticText.contains("response_headers"), "诊断日志记录 HTTP 响应头")
 expect(diagnosticText.contains("stream_done_received"), "诊断日志记录流式完成标记")
@@ -1006,6 +1626,19 @@ if CommandLine.arguments.contains("--live-openai") {
         )
         try liveHistoryStore.upsert(liveUserMessage, position: 0)
         try liveHistoryStore.upsert(liveAssistantMessage, position: 1)
+        try liveHistoryStore.upsertTurn(
+            ChatTurn(
+                id: liveTurnID,
+                mode: .correct,
+                userMessageID: liveUserMessage.id,
+                assistantMessageID: liveAssistantMessage.id,
+                createdAt: liveUserMessage.createdAt,
+                completedAt: Date(),
+                status: .completed,
+                model: model,
+                promptFingerprint: PromptFingerprint.make("live learning test")
+            )
+        )
         let liveEngine = LearningEngine(
             historyStore: liveHistoryStore,
             learningStore: liveLearningStore,
@@ -1022,18 +1655,38 @@ if CommandLine.arguments.contains("--live-openai") {
             apiKey: apiKey,
             model: model
         )
-        let liveQuestion = liveDashboard.activeSession?.attempts.last?.question
-        expect(liveQuestion != nil, "真实模型可以针对弱项生成题目")
-        if let liveQuestion {
+        let liveAttempts = liveDashboard.activeSession?.attempts ?? []
+        expect(
+            liveAttempts.count == LearningEngine.expressionBatchSize
+                && liveAttempts.allSatisfy {
+                    $0.question.type == .chineseToEnglish
+                        && $0.question.batchID != nil
+                },
+            "真实模型一次生成五道中文到英文表达题"
+        )
+        if liveAttempts.count == LearningEngine.expressionBatchSize {
             liveStage("answer grading")
-            liveDashboard = try await liveEngine.submitAnswer(
-                liveQuestion.referenceAnswer,
+            let liveAnswers = Dictionary(
+                uniqueKeysWithValues: liveAttempts.map {
+                    ($0.question.id, $0.question.referenceAnswer)
+                }
+            )
+            liveDashboard = try await liveEngine.submitAnswers(
+                liveAnswers,
                 apiKey: apiKey,
                 model: model
             )
             expect(
-                liveDashboard.activeSession?.attempts.last?.grade != nil,
-                "真实模型可以判题并生成中文讲解"
+                liveDashboard.activeSession?.attempts.allSatisfy {
+                    $0.grade != nil
+                } == true,
+                "真实模型可以一次判定整批答案并生成中文讲解"
+            )
+            expect(
+                liveDashboard.activeSession?.attempts.allSatisfy {
+                    !($0.grade?.patterns.isEmpty ?? true)
+                } == true,
+                "整批判题中的每道题都会生成可复用句式"
             )
         }
         liveStage("complete")

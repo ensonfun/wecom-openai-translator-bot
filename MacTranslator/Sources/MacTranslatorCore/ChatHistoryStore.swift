@@ -41,8 +41,34 @@ public struct ChatHistoryStore: Sendable {
         }
     }
 
+    public func loadRecent(limit: Int) throws -> [ChatMessage] {
+        guard limit > 0 else { return [] }
+        return try withDatabase { database in
+            try migrateLegacyJSONIfNeeded(database)
+            return try readRecentMessages(database, limit: limit)
+        }
+    }
+
+    public func messageCount() throws -> Int {
+        try withDatabase { database in
+            try migrateLegacyJSONIfNeeded(database)
+            let statement = try prepare("SELECT COUNT(*) FROM messages;", database: database)
+            defer { sqlite3_finalize(statement) }
+            guard sqlite3_step(statement) == SQLITE_ROW else {
+                throw databaseError(database)
+            }
+            return Int(sqlite3_column_int64(statement, 0))
+        }
+    }
+
     public func learningSourceTurns() throws -> [LearningSourceTurn] {
-        let messages = try load()
+        let (messages, completedTurnIDs) = try withDatabase { database in
+            try migrateLegacyJSONIfNeeded(database)
+            return (
+                try readMessages(database),
+                try readCompletedTurnIDs(database)
+            )
+        }
         var turns: [LearningSourceTurn] = []
         var assistantByTurnID: [UUID: ChatMessage] = [:]
 
@@ -53,7 +79,12 @@ public struct ChatHistoryStore: Sendable {
         }
 
         for (index, message) in messages.enumerated() {
-            guard message.role == .user, [.correct, .slack].contains(message.mode) else {
+            guard message.role == .user else {
+                continue
+            }
+            if let turnID = message.turnID,
+               message.origin == .native,
+               !completedTurnIDs.contains(turnID) {
                 continue
             }
 
@@ -85,6 +116,30 @@ public struct ChatHistoryStore: Sendable {
     public func upsert(_ message: ChatMessage, position: Int) throws {
         try withDatabase { database in
             try upsert(message, position: position, database: database)
+        }
+    }
+
+    public func append(_ message: ChatMessage) throws {
+        try withDatabase { database in
+            try execute("BEGIN IMMEDIATE TRANSACTION;", database: database)
+            do {
+                let position: Int = try {
+                    let statement = try prepare(
+                        "SELECT COALESCE(MAX(position), -1) + 1 FROM messages;",
+                        database: database
+                    )
+                    defer { sqlite3_finalize(statement) }
+                    guard sqlite3_step(statement) == SQLITE_ROW else {
+                        throw databaseError(database)
+                    }
+                    return Int(sqlite3_column_int64(statement, 0))
+                }()
+                try upsert(message, position: position, database: database)
+                try execute("COMMIT;", database: database)
+            } catch {
+                try? execute("ROLLBACK;", database: database)
+                throw error
+            }
         }
     }
 
@@ -305,6 +360,74 @@ public struct ChatHistoryStore: Sendable {
             )
         }
         return messages
+    }
+
+    private func readRecentMessages(
+        _ database: OpaquePointer,
+        limit: Int
+    ) throws -> [ChatMessage] {
+        let statement = try prepare(
+            """
+            SELECT id, role, text, mode, turn_id, created_at, origin
+            FROM messages
+            ORDER BY position DESC
+            LIMIT ?;
+            """,
+            database: database
+        )
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_bind_int64(statement, 1, Int64(limit)) == SQLITE_OK else {
+            throw databaseError(database)
+        }
+
+        var messages: [ChatMessage] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard
+                let idText = columnText(statement, at: 0),
+                let id = UUID(uuidString: idText),
+                let roleText = columnText(statement, at: 1),
+                let role = ChatMessage.Role(rawValue: roleText),
+                let text = columnText(statement, at: 2),
+                let modeText = columnText(statement, at: 3),
+                let mode = CommandMode(rawValue: modeText),
+                let originText = columnText(statement, at: 6),
+                let origin = ChatMessage.Origin(rawValue: originText)
+            else {
+                throw ChatHistoryStoreError.invalidRow
+            }
+            let turnID = columnText(statement, at: 4).flatMap(UUID.init(uuidString:))
+            let createdAt = Date(timeIntervalSince1970: sqlite3_column_double(statement, 5))
+            messages.append(
+                ChatMessage(
+                    id: id,
+                    role: role,
+                    text: text,
+                    mode: mode,
+                    turnID: turnID,
+                    createdAt: createdAt,
+                    origin: origin
+                )
+            )
+        }
+        return Array(messages.reversed())
+    }
+
+    private func readCompletedTurnIDs(_ database: OpaquePointer) throws -> Set<UUID> {
+        let statement = try prepare(
+            "SELECT id FROM chat_turns WHERE status = ?;",
+            database: database
+        )
+        defer { sqlite3_finalize(statement) }
+        try bind(ChatTurn.Status.completed.rawValue, at: 1, to: statement, database: database)
+
+        var ids = Set<UUID>()
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let text = columnText(statement, at: 0),
+               let id = UUID(uuidString: text) {
+                ids.insert(id)
+            }
+        }
+        return ids
     }
 
     private func replaceAll(_ messages: [ChatMessage], database: OpaquePointer) throws {

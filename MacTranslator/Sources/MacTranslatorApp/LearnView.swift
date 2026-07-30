@@ -2,8 +2,14 @@ import MacTranslatorCore
 import SwiftUI
 
 struct LearnView: View {
+    let isActive: Bool
+
     @StateObject private var viewModel = LearningViewModel()
-    @FocusState private var answerFocused: Bool
+    @State private var isShowingDebug = false
+
+    init(isActive: Bool = true) {
+        self.isActive = isActive
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -19,16 +25,29 @@ struct LearnView: View {
             } else {
                 ScrollView {
                     if let session = viewModel.dashboard?.activeSession {
-                        sessionView(session)
+                        practiceView(session)
                     } else {
-                        learnHome
+                        readyView
                     }
                 }
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
-            viewModel.start()
+            if isActive {
+                viewModel.start()
+            }
+        }
+        .onChange(of: isActive) { _, active in
+            if active {
+                viewModel.start()
+            }
+        }
+        .sheet(isPresented: $isShowingDebug) {
+            LearningDebugView(
+                entries: viewModel.debugEntries,
+                onClear: viewModel.clearDebugEntries
+            )
         }
     }
 
@@ -43,14 +62,14 @@ struct LearnView: View {
                             endPoint: .bottomTrailing
                         )
                     )
-                Image(systemName: "graduationcap.fill")
-                    .font(.system(size: 19, weight: .semibold))
+                Image(systemName: "character.book.closed.fill")
+                    .font(.system(size: 18, weight: .semibold))
                     .foregroundStyle(.white)
             }
             .frame(width: 40, height: 40)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("Personal English Teacher")
+                Text("English Expression Practice")
                     .font(.headline)
                 HStack(spacing: 6) {
                     if viewModel.isSyncing {
@@ -65,6 +84,16 @@ struct LearnView: View {
             Spacer()
 
             Button {
+                viewModel.reloadDebugEntries()
+                isShowingDebug = true
+            } label: {
+                Image(systemName: "ladybug")
+                    .frame(width: 28, height: 28)
+            }
+            .buttonStyle(.plain)
+            .help("Show Learn debug information")
+
+            Button {
                 Task { await viewModel.syncHistory() }
             } label: {
                 Image(systemName: "arrow.triangle.2.circlepath")
@@ -72,7 +101,7 @@ struct LearnView: View {
             }
             .buttonStyle(.plain)
             .disabled(viewModel.isSyncing || viewModel.isWorking || !viewModel.hasAPIKey)
-            .help("Analyze new t/s chats")
+            .help("Analyze recent chats")
 
             Button {
                 viewModel.exportProgress()
@@ -83,7 +112,6 @@ struct LearnView: View {
             .buttonStyle(.plain)
             .disabled((viewModel.dashboard?.analyzedTurnCount ?? 0) == 0)
             .help("Export learning event archive")
-
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -92,39 +120,45 @@ struct LearnView: View {
     private var loadingState: some View {
         VStack(spacing: 14) {
             ProgressView()
-            Text("Loading your teacher…")
+            Text("Preparing five expressions from your recent chats…")
                 .font(.headline)
-            Text("Your profile is rebuilt from the local learning event history.")
+            Text("Only new chat history is analyzed.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private var learnHome: some View {
+    private var readyView: some View {
         VStack(alignment: .leading, spacing: 18) {
             if let completed = viewModel.dashboard?.latestCompletedSession,
                !completed.summary.isEmpty {
-                sessionSummaryCard(completed)
-            }
-
-            if let focus = viewModel.dashboard?.recommendedFocus {
-                focusCard(focus)
-            } else {
-                diagnosticCard
-            }
-
-            metrics
-
-            HStack {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Ready for a short session?")
-                        .font(.headline)
-                    Text("One question at a time · usually 4–7 questions")
-                        .font(.caption)
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("Last practice saved", systemImage: "checkmark.circle.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.green)
+                    Text(completed.summary)
+                        .font(.callout)
                         .foregroundStyle(.secondary)
                 }
-                Spacer()
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+            }
+
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Practise something you actually say", systemImage: "bubble.left.and.text.bubble.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.orange)
+                Text("Review what is due, then learn something new")
+                    .font(.title2.weight(.semibold))
+                Text(
+                    "Each daily plan mixes spaced review with new material from your chats. "
+                        + "If a batch is difficult, Learn keeps the same skill and strengthens it first."
+                )
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
                 if !viewModel.hasAPIKey {
                     SettingsLink {
                         Label("Open shared API settings", systemImage: "key.fill")
@@ -137,7 +171,7 @@ struct LearnView: View {
                         if viewModel.isWorking {
                             ProgressView().controlSize(.small)
                         } else {
-                            Label("Start session", systemImage: "play.fill")
+                            Label("Start practising", systemImage: "play.fill")
                         }
                     }
                     .buttonStyle(.borderedProminent)
@@ -145,197 +179,56 @@ struct LearnView: View {
                     .disabled(viewModel.isWorking || viewModel.isSyncing)
                 }
             }
-            .padding(18)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
-
-            profileSection
+            .padding(22)
+            .background(
+                LinearGradient(
+                    colors: [Color.orange.opacity(0.12), Color.pink.opacity(0.06)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                ),
+                in: RoundedRectangle(cornerRadius: 16)
+            )
         }
         .padding(22)
-        .frame(maxWidth: 900, alignment: .leading)
+        .frame(maxWidth: 860, alignment: .leading)
         .frame(maxWidth: .infinity)
     }
 
-    private func focusCard(_ focus: KnowledgePointSnapshot) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
+    private func practiceView(_ session: LearningSessionSnapshot) -> some View {
+        let batch = currentBatch(in: session)
+        let completedRounds = LearningEngine.completedBatchCount(in: session)
+        let currentRound = completedRounds + (batch.allSatisfy { $0.grade != nil } ? 0 : 1)
+        return VStack(alignment: .leading, spacing: 16) {
             HStack {
-                Label("Today's focus", systemImage: "scope")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.orange)
-                Spacer()
-                Text(focus.lifecycle.title)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Text(focus.title)
-                .font(.title2.weight(.semibold))
-            Text(focusReason(focus))
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-            HStack(spacing: 12) {
-                ProgressView(value: focus.mastery)
-                    .tint(.orange)
-                Text("\(Int((focus.mastery * 100).rounded()))%")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-            if !focus.sourceExcerpt.isEmpty {
-                Label("Seen in your real writing: “\(focus.sourceExcerpt)”", systemImage: "text.quote")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-            }
-        }
-        .padding(20)
-        .background(
-            LinearGradient(
-                colors: [Color.orange.opacity(0.13), Color.pink.opacity(0.07)],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            ),
-            in: RoundedRectangle(cornerRadius: 16)
-        )
-        .overlay {
-            RoundedRectangle(cornerRadius: 16)
-                .stroke(Color.orange.opacity(0.20))
-        }
-    }
-
-    private var diagnosticCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Label("Build your first learning profile", systemImage: "sparkles")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.orange)
-            Text("A short diagnostic will calibrate the first lesson.")
-                .font(.title3.weight(.semibold))
-            Text(
-                viewModel.dashboard?.analyzedTurnCount == 0
-                    ? "Use t or s in Chat, then come back here. Chinese drafts help select useful topics; only your English writing counts as proficiency evidence."
-                    : "No recurring weakness is strong enough yet, so the teacher will start broadly and refine the profile from your answers."
-            )
-            .font(.subheadline)
-            .foregroundStyle(.secondary)
-        }
-        .padding(20)
-        .background(Color.orange.opacity(0.09), in: RoundedRectangle(cornerRadius: 16))
-    }
-
-    private var metrics: some View {
-        HStack(spacing: 12) {
-            metric(
-                value: "\(viewModel.dashboard?.analyzedTurnCount ?? 0)",
-                label: "Chats analyzed",
-                icon: "bubble.left.and.text.bubble.right"
-            )
-            metric(
-                value: "\(viewModel.dashboard?.eligibleEnglishTurnCount ?? 0)",
-                label: "English samples",
-                icon: "character.book.closed"
-            )
-            metric(
-                value: "\(viewModel.dashboard?.knowledgePoints.count ?? 0)",
-                label: "Knowledge points",
-                icon: "point.3.connected.trianglepath.dotted"
-            )
-        }
-    }
-
-    private func metric(value: String, label: String, icon: String) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: icon)
-                .foregroundStyle(.orange)
-                .frame(width: 28, height: 28)
-                .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
-            VStack(alignment: .leading, spacing: 1) {
-                Text(value)
-                    .font(.headline.monospacedDigit())
-                Text(label)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(14)
-        .frame(maxWidth: .infinity)
-        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 12))
-    }
-
-    private var profileSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("Your learning profile")
-                    .font(.headline)
-                Spacer()
-                Text(profileConfidence)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            if let points = viewModel.dashboard?.knowledgePoints, !points.isEmpty {
-                ForEach(Array(points.prefix(8))) { point in
-                    knowledgeRow(point)
-                }
-            } else {
-                Text("Your profile will appear after the first t/s analysis or learning session.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .padding(.vertical, 8)
-            }
-        }
-        .padding(18)
-        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 14))
-    }
-
-    private func knowledgeRow(_ point: KnowledgePointSnapshot) -> some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 7) {
-                    Text(point.title)
-                        .font(.subheadline.weight(.medium))
-                    Text(point.dimension.title)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.primary.opacity(0.06), in: Capsule())
-                }
-                ProgressView(value: point.mastery)
-                    .tint(tint(for: point.lifecycle))
-            }
-            Text("\(Int((point.mastery * 100).rounded()))%")
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
-                .frame(width: 36, alignment: .trailing)
-            Text(point.lifecycle.title)
-                .font(.caption)
-                .foregroundStyle(tint(for: point.lifecycle))
-                .frame(width: 90, alignment: .trailing)
-        }
-    }
-
-    private func sessionView(_ session: LearningSessionSnapshot) -> some View {
-        VStack(alignment: .leading, spacing: 18) {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(session.focusTitle)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(
+                        currentRound > 1
+                            ? "Strengthening round \(currentRound)"
+                            : session.focusPlanKind.title
+                    )
                         .font(.title2.weight(.semibold))
-                    Text(session.focusReason)
+                    Text(
+                        currentRound > 1
+                            ? "Fresh variations for \(session.focusTitle)"
+                            : session.focusReason
+                    )
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("End session") {
+                Button("Finish") {
                     viewModel.endSession()
                 }
                 .buttonStyle(.borderless)
                 .disabled(viewModel.isWorking)
             }
 
-            if let attempt = session.attempts.last {
-                questionCard(attempt, session: session)
+            if !batch.isEmpty {
+                batchCard(batch)
             } else {
                 HStack(spacing: 10) {
                     ProgressView()
-                    Text("Preparing your first question…")
+                    Text("Preparing five expressions…")
                 }
                 .padding(24)
             }
@@ -345,73 +238,103 @@ struct LearnView: View {
         .frame(maxWidth: .infinity)
     }
 
-    private func questionCard(
-        _ attempt: LearningAttemptSnapshot,
-        session: LearningSessionSnapshot
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 18) {
+    private func batchCard(_ batch: [LearningAttemptSnapshot]) -> some View {
+        let isGraded = batch.allSatisfy { $0.grade != nil }
+        let hasSubmittedAnswers = batch.contains { $0.answer != nil }
+
+        return VStack(alignment: .leading, spacing: 18) {
             HStack {
                 Label(
-                    "Question \(attempt.question.ordinal)",
-                    systemImage: "questionmark.bubble"
+                    isGraded ? "Batch feedback" : "Complete all five, then check once",
+                    systemImage: isGraded ? "checkmark.seal.fill" : "square.stack.3d.up.fill"
                 )
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.orange)
+                .font(.headline)
                 Spacer()
-                Text(attempt.question.type.title)
+                Text("\(batch.count) expressions")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
-            if !attempt.question.context.isEmpty {
-                Text(attempt.question.context)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
+            if isGraded {
+                batchResultSummary(batch)
 
-            Text(attempt.question.prompt)
-                .font(.title3.weight(.medium))
-                .textSelection(.enabled)
-
-            if let grade = attempt.grade {
-                feedbackView(grade, answer: attempt.answer ?? "")
+                ForEach(Array(batch.enumerated()), id: \.element.id) { index, attempt in
+                    gradedExpression(attempt, index: index)
+                }
 
                 HStack {
+                    Button("Finish for now") {
+                        viewModel.endSession()
+                    }
+                    .disabled(viewModel.isWorking)
+
                     Spacer()
+
                     Button {
                         viewModel.continueSession()
                     } label: {
                         if viewModel.isWorking {
                             ProgressView().controlSize(.small)
                         } else {
-                            Label(nextButtonTitle(session), systemImage: "arrow.right")
+                            Label(
+                                continueButtonTitle(for: batch),
+                                systemImage: continueButtonIcon(for: batch)
+                            )
                         }
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
                     .disabled(viewModel.isWorking)
                 }
-            } else if attempt.answer != nil {
+            } else if hasSubmittedAnswers {
+                ForEach(Array(batch.enumerated()), id: \.element.id) { index, attempt in
+                    submittedExpression(attempt, index: index)
+                }
+
                 HStack(spacing: 10) {
                     if viewModel.isWorking {
                         ProgressView()
                     }
                     Text(
                         viewModel.isWorking
-                            ? "Checking your answer and preparing an explanation…"
-                            : "Your answer is saved and still needs to be graded."
+                            ? "Checking all five expressions together…"
+                            : "Your batch is saved and still needs to be checked."
                     )
                     .foregroundStyle(.secondary)
                     Spacer()
                     if !viewModel.isWorking {
-                        Button("Retry grading") {
+                        Button("Retry checking") {
                             viewModel.startOrResumeSession()
                         }
                     }
                 }
                 .padding(.vertical, 20)
             } else {
-                answerEditor(attempt)
+                ForEach(Array(batch.enumerated()), id: \.element.id) { index, attempt in
+                    expressionEditor(attempt, index: index)
+                }
+
+                HStack {
+                    Button("Replace batch") {
+                        viewModel.replaceBatch()
+                    }
+                    .disabled(viewModel.isWorking)
+
+                    Spacer()
+
+                    Button {
+                        viewModel.submitBatch()
+                    } label: {
+                        if viewModel.isWorking {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Label("Check all five", systemImage: "checkmark.circle.fill")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .disabled(!allAnswersComplete(in: batch) || viewModel.isWorking)
+                }
             }
         }
         .padding(22)
@@ -422,72 +345,206 @@ struct LearnView: View {
         }
     }
 
-    private func answerEditor(_ attempt: LearningAttemptSnapshot) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
+    private func batchResultSummary(
+        _ batch: [LearningAttemptSnapshot]
+    ) -> some View {
+        let successfulCount = successfulCount(in: batch)
+        let session = viewModel.dashboard?.activeSession
+        let completedBatchCount = session.map {
+            LearningEngine.completedBatchCount(in: $0)
+        } ?? 1
+        let outcome = LearningEngine.batchOutcome(
+            successfulCount: successfulCount,
+            completedBatchCount: completedBatchCount
+        )
+        let nextReview = session?.focusKnowledgePointID.flatMap { focusID in
+            viewModel.dashboard?.knowledgePoints.first { $0.id == focusID }?.dueAt
+        }
+        let nextReviewText = nextReview.map {
+            " Next review: \($0.formatted(date: .abbreviated, time: .omitted))."
+        } ?? ""
+        let message: String
+        let color: Color
+        let icon: String
+        switch outcome {
+        case .passed:
+            message = "\(successfulCount)/\(batch.count) passed. This is today's pass, "
+                + "not permanent mastery; Learn will bring it back after a delay."
+                + nextReviewText
+            color = .green
+            icon = "calendar.badge.checkmark"
+        case .reinforce:
+            message = "\(successfulCount)/\(batch.count) passed. The next batch will keep "
+                + "this skill and target the issues above with fresh variations."
+            color = .orange
+            icon = "arrow.triangle.2.circlepath"
+        case .paused:
+            message = "\(successfulCount)/\(batch.count) passed after three rounds. "
+                + "This skill is scheduled for priority review."
+                + nextReviewText
+            color = .orange
+            icon = "calendar.badge.clock"
+        }
+        return Label(message, systemImage: icon)
+            .font(.callout.weight(.medium))
+            .foregroundStyle(color)
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(color.opacity(0.09), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func successfulCount(
+        in batch: [LearningAttemptSnapshot]
+    ) -> Int {
+        batch.filter {
+            guard let grade = $0.grade else { return false }
+            return grade.targetDemonstrated
+                && (grade.verdict == .correct || grade.verdict == .acceptable)
+        }.count
+    }
+
+    private func continueButtonTitle(
+        for batch: [LearningAttemptSnapshot]
+    ) -> String {
+        guard let session = viewModel.dashboard?.activeSession else {
+            return "Continue today's plan"
+        }
+        let outcome = LearningEngine.batchOutcome(
+            successfulCount: successfulCount(in: batch),
+            completedBatchCount: LearningEngine.completedBatchCount(in: session)
+        )
+        return outcome == .reinforce
+            ? "Strengthen this skill"
+            : "Continue today's plan"
+    }
+
+    private func continueButtonIcon(
+        for batch: [LearningAttemptSnapshot]
+    ) -> String {
+        guard let session = viewModel.dashboard?.activeSession else {
+            return "arrow.right"
+        }
+        let outcome = LearningEngine.batchOutcome(
+            successfulCount: successfulCount(in: batch),
+            completedBatchCount: LearningEngine.completedBatchCount(in: session)
+        )
+        return outcome == .reinforce
+            ? "arrow.triangle.2.circlepath"
+            : "arrow.right"
+    }
+
+    private func expressionEditor(
+        _ attempt: LearningAttemptSnapshot,
+        index: Int
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            expressionPrompt(attempt, index: index)
+
+            let answer = answerBinding(for: attempt.question.id)
             ZStack(alignment: .topLeading) {
-                if viewModel.answer.isEmpty {
-                    Text("Write your answer in English…")
+                if answer.wrappedValue.isEmpty {
+                    Text("Write your English expression…")
                         .foregroundStyle(.tertiary)
                         .padding(.horizontal, 9)
                         .padding(.vertical, 10)
                         .allowsHitTesting(false)
                 }
-                TextEditor(text: $viewModel.answer)
+                TextEditor(text: answer)
                     .font(.body)
                     .scrollContentBackground(.hidden)
                     .padding(6)
-                    .focused($answerFocused)
             }
-            .frame(minHeight: 110)
+            .frame(minHeight: 90)
             .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
             .overlay {
                 RoundedRectangle(cornerRadius: 12)
                     .stroke(Color.primary.opacity(0.12))
             }
 
-            if attempt.hintUsed {
-                Label(attempt.question.hint, systemImage: "lightbulb.fill")
-                    .font(.callout)
-                    .foregroundStyle(.orange)
-                    .padding(12)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.orange.opacity(0.09), in: RoundedRectangle(cornerRadius: 10))
-            }
+        }
+        .padding(16)
+        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
+    }
 
-            HStack {
-                Button {
-                    viewModel.requestHint()
-                } label: {
-                    Label(attempt.hintUsed ? "Hint shown" : "Hint", systemImage: "lightbulb")
-                }
-                .disabled(attempt.hintUsed || viewModel.isWorking)
-
-                Button("Skip") {
-                    viewModel.skipQuestion()
-                }
-                .disabled(viewModel.isWorking)
-
-                Spacer()
-
-                Button {
-                    viewModel.submitAnswer()
-                } label: {
-                    if viewModel.isWorking {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Label("Check answer", systemImage: "checkmark.circle.fill")
-                    }
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .disabled(
-                    viewModel.answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        || viewModel.isWorking
-                )
+    private func submittedExpression(
+        _ attempt: LearningAttemptSnapshot,
+        index: Int
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            expressionPrompt(attempt, index: index)
+            feedbackSection(title: "Your expression") {
+                Text(attempt.answer ?? "")
+                    .textSelection(.enabled)
             }
         }
-        .onAppear {
-            answerFocused = true
+        .padding(16)
+        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func gradedExpression(
+        _ attempt: LearningAttemptSnapshot,
+        index: Int
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            expressionPrompt(attempt, index: index)
+            if let grade = attempt.grade {
+                feedbackView(grade, answer: attempt.answer ?? "")
+            }
+        }
+        .padding(16)
+        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func expressionPrompt(
+        _ attempt: LearningAttemptSnapshot,
+        index: Int
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Expression \(index + 1)")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.orange)
+                if !attempt.question.context.isEmpty {
+                    Text(attempt.question.context)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Text(attempt.question.prompt)
+                .font(.title3.weight(.medium))
+                .lineSpacing(4)
+                .textSelection(.enabled)
+        }
+    }
+
+    private func answerBinding(for questionID: UUID) -> Binding<String> {
+        Binding(
+            get: { viewModel.batchAnswers[questionID] ?? "" },
+            set: { viewModel.batchAnswers[questionID] = $0 }
+        )
+    }
+
+    private func allAnswersComplete(
+        in batch: [LearningAttemptSnapshot]
+    ) -> Bool {
+        batch.count == LearningEngine.expressionBatchSize
+            && batch.allSatisfy {
+                !(viewModel.batchAnswers[$0.question.id] ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .isEmpty
+            }
+    }
+
+    private func currentBatch(
+        in session: LearningSessionSnapshot
+    ) -> [LearningAttemptSnapshot] {
+        guard let batchID = session.attempts.last?.question.batchID else {
+            return []
+        }
+        return session.attempts.filter {
+            $0.question.batchID == batchID
+        }.sorted {
+            ($0.question.batchIndex ?? 0) < ($1.question.batchIndex ?? 0)
         }
     }
 
@@ -495,74 +552,95 @@ struct LearnView: View {
         _ grade: AnswerGradedPayload,
         answer: String
     ) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Image(systemName: verdictIcon(grade.verdict))
-                Text(grade.verdict.title)
-                    .font(.headline)
-                Spacer()
-                Text("\(Int((grade.confidence * 100).rounded()))% confidence")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .foregroundStyle(verdictColor(grade.verdict))
+        VStack(alignment: .leading, spacing: 16) {
+            Label(grade.verdict.title, systemImage: verdictIcon(grade.verdict))
+                .font(.headline)
+                .foregroundStyle(verdictColor(grade.verdict))
 
-            VStack(alignment: .leading, spacing: 5) {
-                Text("Your answer")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+            feedbackSection(title: "Your expression") {
                 Text(answer)
                     .textSelection(.enabled)
             }
 
-            if !grade.correctedAnswer.isEmpty, grade.correctedAnswer != answer {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("A stronger answer")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
+            if !grade.correctedAnswer.isEmpty {
+                feedbackSection(title: "Recommended expression") {
                     Text(grade.correctedAnswer)
                         .textSelection(.enabled)
                 }
                 .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
             }
 
-            Text(grade.explanationZH)
-                .lineSpacing(3)
-                .textSelection(.enabled)
+            if !grade.alternativeAnswers.isEmpty {
+                feedbackSection(title: "Natural alternatives") {
+                    ForEach(Array(grade.alternativeAnswers.enumerated()), id: \.offset) { _, answer in
+                        Text("• \(answer)")
+                            .textSelection(.enabled)
+                    }
+                }
+            }
 
             if !grade.issues.isEmpty {
-                VStack(alignment: .leading, spacing: 5) {
+                feedbackSection(title: "Key issues") {
                     ForEach(Array(grade.issues.enumerated()), id: \.offset) { _, issue in
                         Label(issue, systemImage: "smallcircle.filled.circle")
                             .font(.callout)
                     }
                 }
             }
+
+            if !grade.patterns.isEmpty {
+                feedbackSection(title: "Useful sentence patterns") {
+                    ForEach(Array(grade.patterns.enumerated()), id: \.offset) { _, pattern in
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(pattern.pattern)
+                                .font(.body.weight(.semibold))
+                                .textSelection(.enabled)
+                            Text(pattern.meaningZH)
+                                .font(.callout)
+                            Text(pattern.example)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                        .padding(.vertical, 3)
+                    }
+                }
+            }
+
+            feedbackSection(title: "Focused explanation") {
+                if grade.keyExplanationsZH.isEmpty {
+                    Text(grade.explanationZH)
+                        .lineSpacing(3)
+                        .textSelection(.enabled)
+                } else {
+                    ForEach(Array(grade.keyExplanationsZH.enumerated()), id: \.offset) { _, point in
+                        Text("• \(point)")
+                            .lineSpacing(3)
+                            .textSelection(.enabled)
+                    }
+                }
+            }
         }
         .padding(16)
-        .background(verdictColor(grade.verdict).opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+        .background(verdictColor(grade.verdict).opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
         .overlay {
             RoundedRectangle(cornerRadius: 12)
-                .stroke(verdictColor(grade.verdict).opacity(0.18))
+                .stroke(verdictColor(grade.verdict).opacity(0.16))
         }
     }
 
-    private func sessionSummaryCard(_ session: LearningSessionSnapshot) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label("Last session", systemImage: "checkmark.seal.fill")
+    private func feedbackSection<Content: View>(
+        title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(.green)
-            Text(session.focusTitle)
-                .font(.headline)
-            Text(session.summary)
-                .font(.callout)
                 .foregroundStyle(.secondary)
+            content()
         }
-        .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
     }
 
     private func errorBanner(_ message: String) -> some View {
@@ -584,48 +662,6 @@ struct LearnView: View {
         .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
         .padding(.horizontal, 20)
         .padding(.top, 10)
-    }
-
-    private var profileConfidence: String {
-        let count = viewModel.dashboard?.eligibleEnglishTurnCount ?? 0
-        switch count {
-        case 0..<10: return "Gathering evidence"
-        case 10..<30: return "Provisional profile"
-        case 30..<100: return "Developing confidence"
-        default: return "High-confidence profile"
-        }
-    }
-
-    private func focusReason(_ point: KnowledgePointSnapshot) -> String {
-        if point.realChatErrorCount > 0 {
-            return "Selected because it appeared in \(point.realChatErrorCount) real t/s message"
-                + (point.realChatErrorCount == 1 ? "." : "s.")
-        }
-        if let due = point.dueAt, due <= Date() {
-            return "This knowledge point is due for review."
-        }
-        return "The teacher selected this to strengthen your current profile."
-    }
-
-    private func nextButtonTitle(_ session: LearningSessionSnapshot) -> String {
-        if session.successfulAttemptCount >= 2,
-           session.completedQuestionTypes.count >= 2 {
-            return "Finish session"
-        }
-        if session.consecutiveFailureCount >= 2 {
-            return "Save and review later"
-        }
-        return "Next question"
-    }
-
-    private func tint(for state: KnowledgeLifecycleState) -> Color {
-        switch state {
-        case .maintained: .green
-        case .masteryCandidate, .consolidating: .blue
-        case .lapsed, .weaknessDetected: .orange
-        case .learning: .purple
-        case .unobserved: .secondary
-        }
     }
 
     private func verdictColor(_ verdict: LearningVerdict) -> Color {
