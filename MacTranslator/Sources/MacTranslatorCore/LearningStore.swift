@@ -344,10 +344,17 @@ public struct LearningStore: Sendable {
                 idempotency_key TEXT NOT NULL UNIQUE,
                 producer TEXT NOT NULL,
                 model TEXT,
+                reasoning_effort TEXT,
                 prompt_version TEXT,
                 payload_json TEXT NOT NULL
             );
             """,
+            database: database
+        )
+        try addColumnIfNeeded(
+            table: "learning_events",
+            column: "reasoning_effort",
+            definition: "TEXT",
             database: database
         )
         try execute(
@@ -467,9 +474,9 @@ public struct LearningStore: Sendable {
                 event_id, event_type, occurred_at, recorded_at, schema_version,
                 learner_epoch, session_id, knowledge_point_id, source_turn_id,
                 correlation_id, causation_id, idempotency_key, producer, model,
-                prompt_version, payload_json
+                reasoning_effort, prompt_version, payload_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """,
             database: database
         )
@@ -489,8 +496,9 @@ public struct LearningStore: Sendable {
         try bind(event.idempotencyKey, at: 12, to: statement, database: database)
         try bind(event.producer, at: 13, to: statement, database: database)
         try bindOptional(event.model, at: 14, to: statement, database: database)
-        try bindOptional(event.promptVersion, at: 15, to: statement, database: database)
-        try bind(event.payloadJSON, at: 16, to: statement, database: database)
+        try bindOptional(event.reasoningEffort?.rawValue, at: 15, to: statement, database: database)
+        try bindOptional(event.promptVersion, at: 16, to: statement, database: database)
+        try bind(event.payloadJSON, at: 17, to: statement, database: database)
         try stepDone(statement, database: database)
         return sqlite3_changes(database) > 0
     }
@@ -502,7 +510,7 @@ public struct LearningStore: Sendable {
                 sequence, event_id, event_type, occurred_at, recorded_at,
                 schema_version, learner_epoch, session_id, knowledge_point_id,
                 source_turn_id, correlation_id, causation_id, idempotency_key,
-                producer, model, prompt_version, payload_json
+                producer, model, reasoning_effort, prompt_version, payload_json
             FROM learning_events
             ORDER BY sequence ASC;
             """,
@@ -521,7 +529,7 @@ public struct LearningStore: Sendable {
                 let epoch = UUID(uuidString: epochText),
                 let idempotencyKey = columnText(statement, at: 12),
                 let producer = columnText(statement, at: 13),
-                let payloadJSON = columnText(statement, at: 16)
+                let payloadJSON = columnText(statement, at: 17)
             else {
                 throw LearningStoreError.invalidPayload
             }
@@ -542,7 +550,10 @@ public struct LearningStore: Sendable {
                     idempotencyKey: idempotencyKey,
                     producer: producer,
                     model: columnText(statement, at: 14),
-                    promptVersion: columnText(statement, at: 15),
+                    reasoningEffort: columnText(statement, at: 15).flatMap(
+                        OpenAIReasoningEffort.init(rawValue:)
+                    ),
+                    promptVersion: columnText(statement, at: 16),
                     payloadJSON: payloadJSON
                 )
             )
@@ -821,6 +832,25 @@ public struct LearningStore: Sendable {
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw databaseError(database)
         }
+    }
+
+    private func addColumnIfNeeded(
+        table: String,
+        column: String,
+        definition: String,
+        database: OpaquePointer
+    ) throws {
+        let statement = try prepare("PRAGMA table_info(\(table));", database: database)
+        defer { sqlite3_finalize(statement) }
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if columnText(statement, at: 1) == column {
+                return
+            }
+        }
+        try execute(
+            "ALTER TABLE \(table) ADD COLUMN \(column) \(definition);",
+            database: database
+        )
     }
 
     private func columnText(_ statement: OpaquePointer, at index: Int32) -> String? {

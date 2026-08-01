@@ -135,15 +135,19 @@ final class LearningViewModel: ObservableObject {
         }
         isSyncing = true
         syncMessage = "Checking recent chats…"
+        let profile = resolvedAnalysisProfile
         diagnosticLogger.event(
             "learning_sync_requested",
             component: "learn",
-            details: ["model": .string(resolvedModel)]
+            details: [
+                "model": .string(profile.model),
+                "reasoning_effort": .string(profile.reasoningEffort.rawValue)
+            ]
         )
         do {
             let result = try await engine.syncHistory(
                 apiKey: apiKey,
-                model: resolvedModel
+                profile: profile
             )
             dashboard = try await engine.loadDashboard()
             if result.analyzedTurnCount > 0 {
@@ -190,8 +194,8 @@ final class LearningViewModel: ObservableObject {
     }
 
     func startOrResumeSession() {
-        performAPIWork(action: "start_or_resume_session") { [engine] apiKey, model in
-            try await engine.startOrResumeSession(apiKey: apiKey, model: model)
+        performAPIWork(action: "start_or_resume_session") { [engine] apiKey, profile in
+            try await engine.startOrResumeSession(apiKey: apiKey, profile: profile)
         }
     }
 
@@ -200,8 +204,8 @@ final class LearningViewModel: ObservableObject {
         performAPIWork(
             action: "submit_answer_batch",
             details: ["answer_count": .integer(submitted.count)]
-        ) { [engine] apiKey, model in
-            try await engine.submitAnswers(submitted, apiKey: apiKey, model: model)
+        ) { [engine] apiKey, profile in
+            try await engine.submitAnswers(submitted, apiKey: apiKey, profile: profile)
         }
     }
 
@@ -209,8 +213,8 @@ final class LearningViewModel: ObservableObject {
         performAPIWork(
             action: "continue_session",
             clearBatchAnswers: true
-        ) { [engine] apiKey, model in
-            try await engine.continueSession(apiKey: apiKey, model: model)
+        ) { [engine] apiKey, profile in
+            try await engine.continueSession(apiKey: apiKey, profile: profile)
         }
     }
 
@@ -248,8 +252,8 @@ final class LearningViewModel: ObservableObject {
         performAPIWork(
             action: "replace_batch",
             clearBatchAnswers: true
-        ) { [engine] apiKey, model in
-            try await engine.replaceBatch(apiKey: apiKey, model: model)
+        ) { [engine] apiKey, profile in
+            try await engine.replaceBatch(apiKey: apiKey, profile: profile)
         }
     }
 
@@ -347,7 +351,10 @@ final class LearningViewModel: ObservableObject {
         action: String,
         clearBatchAnswers: Bool = false,
         details: [String: DiagnosticValue] = [:],
-        _ work: @escaping @Sendable (String, String) async throws -> LearningDashboard
+        _ work: @escaping @Sendable (
+            String,
+            OpenAIModelProfile
+        ) async throws -> LearningDashboard
     ) {
         guard !isWorking else { return }
         refreshCredentials()
@@ -366,9 +373,11 @@ final class LearningViewModel: ObservableObject {
         }
         isWorking = true
         errorMessage = nil
+        let profile = resolvedInteractiveProfile
         var startedDetails = details
         startedDetails["action"] = .string(action)
-        startedDetails["model"] = .string(resolvedModel)
+        startedDetails["model"] = .string(profile.model)
+        startedDetails["reasoning_effort"] = .string(profile.reasoningEffort.rawValue)
         diagnosticLogger.event(
             "learning_action_started",
             component: "learn",
@@ -377,7 +386,7 @@ final class LearningViewModel: ObservableObject {
         workTask = Task { [weak self] in
             guard let self else { return }
             do {
-                dashboard = try await work(apiKey, resolvedModel)
+                dashboard = try await work(apiKey, profile)
                 if clearBatchAnswers {
                     batchAnswers = [:]
                 }
@@ -514,16 +523,21 @@ final class LearningViewModel: ObservableObject {
             return
         }
         isWorking = true
+        let profile = resolvedInteractiveProfile
         diagnosticLogger.event(
             "learning_exercise_preparation_started",
             component: "learn",
             operationID: session?.id,
-            details: ["attempt_count": .integer(session?.attempts.count ?? 0)]
+            details: [
+                "attempt_count": .integer(session?.attempts.count ?? 0),
+                "model": .string(profile.model),
+                "reasoning_effort": .string(profile.reasoningEffort.rawValue)
+            ]
         )
         do {
             dashboard = try await engine.startOrResumeSession(
                 apiKey: apiKey,
-                model: resolvedModel
+                profile: profile
             )
             diagnosticLogger.event(
                 "learning_exercise_preparation_completed",
@@ -559,8 +573,12 @@ final class LearningViewModel: ObservableObject {
         SharedOpenAIConfiguration.apiKey(from: keychain)
     }
 
-    private var resolvedModel: String {
-        SharedOpenAIConfiguration.model
+    private var resolvedAnalysisProfile: OpenAIModelProfile {
+        SharedOpenAIConfiguration.learningAnalysisProfile
+    }
+
+    private var resolvedInteractiveProfile: OpenAIModelProfile {
+        SharedOpenAIConfiguration.learningInteractiveProfile
     }
 
     private static func dashboardDetails(

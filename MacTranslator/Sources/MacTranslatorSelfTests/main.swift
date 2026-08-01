@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import MacTranslatorCore
 import Security
+import SQLite3
 
 var failures = 0
 
@@ -401,6 +402,18 @@ expect(
 expect(
     AppSettings.resolvedModel("  custom-model  ") == "custom-model",
     "自定义模型名只会移除首尾空白"
+)
+expect(
+    AppSettings.resolvedModel("", fallback: "fallback-model") == "fallback-model",
+    "空模型设置会使用对应工作负载的默认模型"
+)
+expect(
+    AppSettings.resolvedReasoningEffort("xhigh", fallback: .medium) == .xhigh,
+    "有效 reasoning effort 设置会被保留"
+)
+expect(
+    AppSettings.resolvedReasoningEffort("invalid", fallback: .medium) == .medium,
+    "无效 reasoning effort 设置会回退到默认值"
 )
 expect(
     KeychainError.from(status: errSecAuthFailed).requiresLoginKeychainReconnect,
@@ -810,6 +823,83 @@ let learningStore = LearningStore(
     diagnosticLogger: learningTestLogger
 )
 
+let legacyLearningTestDirectory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("MacTranslatorLegacyLearningTests-\(UUID().uuidString)", isDirectory: true)
+defer { try? FileManager.default.removeItem(at: legacyLearningTestDirectory) }
+
+do {
+    try FileManager.default.createDirectory(
+        at: legacyLearningTestDirectory,
+        withIntermediateDirectories: true
+    )
+    let legacyDatabaseURL = legacyLearningTestDirectory
+        .appendingPathComponent("chat-history.sqlite3")
+    var legacyDatabase: OpaquePointer?
+    guard sqlite3_open(legacyDatabaseURL.path, &legacyDatabase) == SQLITE_OK,
+          let legacyDatabase else {
+        throw NSError(
+            domain: "MacTranslatorSelfTests",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "Could not create legacy learning database."]
+        )
+    }
+    let legacySchema = """
+        CREATE TABLE learning_events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL UNIQUE,
+            event_type TEXT NOT NULL,
+            occurred_at REAL NOT NULL,
+            recorded_at REAL NOT NULL,
+            schema_version INTEGER NOT NULL,
+            learner_epoch TEXT NOT NULL,
+            session_id TEXT,
+            knowledge_point_id TEXT,
+            source_turn_id TEXT,
+            correlation_id TEXT,
+            causation_id TEXT,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            producer TEXT NOT NULL,
+            model TEXT,
+            prompt_version TEXT,
+            payload_json TEXT NOT NULL
+        );
+        """
+    let legacySchemaResult = sqlite3_exec(legacyDatabase, legacySchema, nil, nil, nil)
+    sqlite3_close(legacyDatabase)
+    guard legacySchemaResult == SQLITE_OK else {
+        throw NSError(
+            domain: "MacTranslatorSelfTests",
+            code: 3,
+            userInfo: [NSLocalizedDescriptionKey: "Could not create legacy learning schema."]
+        )
+    }
+
+    let legacyStore = LearningStore(
+        directoryURL: legacyLearningTestDirectory,
+        diagnosticLogger: learningTestLogger
+    )
+    let legacySessionID = UUID()
+    try legacyStore.append(
+        PendingLearningEvent(
+            type: .learningSessionStarted,
+            sessionID: legacySessionID,
+            idempotencyKey: "legacy-reasoning-migration",
+            producer: "self_test",
+            model: "migration-model",
+            reasoningEffort: .medium,
+            payload: LearningSessionStartedPayload(
+                sessionID: legacySessionID,
+                startedAt: Date()
+            )
+        )
+    )
+    let migratedReasoningEffort = try legacyStore.loadEvents().first?.reasoningEffort
+    expect(migratedReasoningEffort == .medium, "旧学习数据库会自动增加 reasoning effort 字段")
+} catch {
+    failures += 1
+    print("✗ 学习数据库迁移自检出错：\(error.localizedDescription)")
+}
+
 do {
     let sourceTurnID = UUID()
     let observedAt = Date(timeIntervalSince1970: 1_725_000_100)
@@ -838,12 +928,17 @@ do {
         sourceTurnID: sourceTurnID,
         idempotencyKey: "self-test-evidence",
         producer: "self_test",
+        model: "self-test-analysis-model",
+        reasoningEffort: .high,
         payload: evidencePayload
     )
     let firstEvidenceInsert = try learningStore.append(evidenceEvent)
     let duplicateEvidenceInsert = try learningStore.append(evidenceEvent)
     expect(firstEvidenceInsert, "学习事件可以追加到事件存储")
     expect(!duplicateEvidenceInsert, "相同幂等键不会重复写入学习事件")
+    let persistedEvidenceEvent = try learningStore.loadEvents().first
+    expect(persistedEvidenceEvent?.model == "self-test-analysis-model", "学习事件会记录模型")
+    expect(persistedEvidenceEvent?.reasoningEffort == .high, "学习事件会记录 reasoning effort")
 
     let completionPayload = SourceTurnAnalysisCompletedPayload(
         sourceTurnID: sourceTurnID,
@@ -1272,6 +1367,7 @@ do {
     let structured: StructuredSelfTestOutput = try await retryClient.structuredResponse(
         apiKey: secretAPIKey,
         model: "self-test-model",
+        reasoningEffort: .high,
         instructions: "Return structured JSON.",
         input: secretChatText,
         schemaName: "self_test",
@@ -1287,9 +1383,11 @@ do {
     }
     let textObject = requestObject?["text"] as? [String: Any]
     let formatObject = textObject?["format"] as? [String: Any]
+    let reasoningObject = requestObject?["reasoning"] as? [String: Any]
     expect(formatObject?["type"] as? String == "json_schema", "结构化请求使用 text.format JSON Schema")
     expect(requestObject?["store"] as? Bool == false, "学习请求明确关闭服务端响应存储")
     expect(requestObject?["background"] as? Bool == true, "学习请求启用 Responses background mode")
+    expect(reasoningObject?["effort"] as? String == "high", "学习请求会发送 reasoning.effort")
 
     let debugEntry = learningDebugStore.entries().first
     expect(debugEntry?.instructions == "Return structured JSON.", "Learn Debug 记录输入 prompt")
@@ -1775,7 +1873,18 @@ if CommandLine.arguments.contains("--live-openai") {
             client: liveClient,
             diagnosticLogger: liveLogger
         )
-        let liveSync = try await liveEngine.syncHistory(apiKey: apiKey, model: model)
+        let liveAnalysisProfile = OpenAIModelProfile(
+            model: model,
+            reasoningEffort: .medium
+        )
+        let liveInteractiveProfile = OpenAIModelProfile(
+            model: model,
+            reasoningEffort: .medium
+        )
+        let liveSync = try await liveEngine.syncHistory(
+            apiKey: apiKey,
+            profile: liveAnalysisProfile
+        )
         expect(
             liveSync.analyzedTurnCount == 1 && liveSync.evidenceCount > 0,
             "真实模型可以从 t 记录提取学习证据"
@@ -1783,7 +1892,7 @@ if CommandLine.arguments.contains("--live-openai") {
         liveStage("question generation")
         var liveDashboard = try await liveEngine.startOrResumeSession(
             apiKey: apiKey,
-            model: model
+            profile: liveInteractiveProfile
         )
         let liveAttempts = liveDashboard.activeSession?.attempts ?? []
         expect(
@@ -1804,7 +1913,7 @@ if CommandLine.arguments.contains("--live-openai") {
             liveDashboard = try await liveEngine.submitAnswers(
                 liveAnswers,
                 apiKey: apiKey,
-                model: model
+                profile: liveInteractiveProfile
             )
             expect(
                 liveDashboard.activeSession?.attempts.allSatisfy {

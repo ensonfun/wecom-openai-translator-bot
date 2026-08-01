@@ -5,6 +5,16 @@ import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @AppStorage(AppSettings.modelKey) private var model = AppSettings.defaultModel
+    @AppStorage(AppSettings.learningAnalysisModelKey)
+    private var learningAnalysisModel = AppSettings.defaultLearningAnalysisModel
+    @AppStorage(AppSettings.learningAnalysisReasoningEffortKey)
+    private var learningAnalysisReasoningEffort =
+        AppSettings.defaultLearningAnalysisReasoningEffort.rawValue
+    @AppStorage(AppSettings.learningInteractiveModelKey)
+    private var learningInteractiveModel = AppSettings.defaultLearningInteractiveModel
+    @AppStorage(AppSettings.learningInteractiveReasoningEffortKey)
+    private var learningInteractiveReasoningEffort =
+        AppSettings.defaultLearningInteractiveReasoningEffort.rawValue
     @State private var apiKey = ""
     @State private var showAPIKey = false
     @State private var globalShortcutEnabled = false
@@ -153,7 +163,7 @@ struct SettingsView: View {
 
     private var openAISettings: some View {
         Form {
-            Section("OpenAI") {
+            Section("OpenAI API") {
                 HStack {
                     if showAPIKey {
                         TextField("sk-…", text: $apiKey)
@@ -169,12 +179,48 @@ struct SettingsView: View {
                     .help(showAPIKey ? "Hide API Key" : "Show API Key")
                 }
 
+                Text("The API key is shared by Chat and Learn and is stored only in macOS Keychain.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Chat") {
                 TextField("Model", text: $model)
                     .textFieldStyle(.roundedBorder)
 
                 Text(
-                    "Chat and Learn share this API key and model. The key is stored only in macOS Keychain. The default model is \(AppSettings.defaultModel)."
+                    "Used for translation, correction, and Slack message requests. Default: \(AppSettings.defaultModel)."
                 )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Learning · History Analysis") {
+                TextField("Model", text: $learningAnalysisModel)
+                    .textFieldStyle(.roundedBorder)
+
+                Picker("Reasoning effort", selection: $learningAnalysisReasoningEffort) {
+                    ForEach(OpenAIReasoningEffort.allCases) { effort in
+                        Text(effort.title).tag(effort.rawValue)
+                    }
+                }
+
+                Text("Analyzes new t/s history and builds the evidence used to choose a learning focus.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Learning · Exercises and Grading") {
+                TextField("Model", text: $learningInteractiveModel)
+                    .textFieldStyle(.roundedBorder)
+
+                Picker("Reasoning effort", selection: $learningInteractiveReasoningEffort) {
+                    ForEach(OpenAIReasoningEffort.allCases) { effort in
+                        Text(effort.title).tag(effort.rawValue)
+                    }
+                }
+
+                Text("Generates each exercise and grades the learner's answer during an active session.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -418,6 +464,22 @@ struct SettingsView: View {
             if model.isEmpty {
                 model = AppSettings.defaultModel
             }
+            learningAnalysisModel = AppSettings.resolvedModel(
+                learningAnalysisModel,
+                fallback: AppSettings.defaultLearningAnalysisModel
+            )
+            learningAnalysisReasoningEffort = AppSettings.resolvedReasoningEffort(
+                learningAnalysisReasoningEffort,
+                fallback: AppSettings.defaultLearningAnalysisReasoningEffort
+            ).rawValue
+            learningInteractiveModel = AppSettings.resolvedModel(
+                learningInteractiveModel,
+                fallback: AppSettings.defaultLearningInteractiveModel
+            )
+            learningInteractiveReasoningEffort = AppSettings.resolvedReasoningEffort(
+                learningInteractiveReasoningEffort,
+                fallback: AppSettings.defaultLearningInteractiveReasoningEffort
+            ).rawValue
             prompts.save()
             GlobalShortcutPreferences.save(
                 enabled: globalShortcutEnabled,
@@ -437,6 +499,14 @@ struct SettingsView: View {
                 details: [
                     "api_key_available": .boolean(!apiKey.isEmpty),
                     "model": .string(model),
+                    "learning_analysis_model": .string(learningAnalysisModel),
+                    "learning_analysis_reasoning_effort": .string(
+                        learningAnalysisReasoningEffort
+                    ),
+                    "learning_interactive_model": .string(learningInteractiveModel),
+                    "learning_interactive_reasoning_effort": .string(
+                        learningInteractiveReasoningEffort
+                    ),
                     "translate_prompt": .string(prompts.translate),
                     "correct_prompt": .string(prompts.correct),
                     "slack_prompt": .string(prompts.slack),
