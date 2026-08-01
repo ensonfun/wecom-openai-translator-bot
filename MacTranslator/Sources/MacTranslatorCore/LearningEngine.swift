@@ -4,7 +4,6 @@ public actor LearningEngine {
     public static let expressionBatchSize = 5
     public static let automaticHistorySyncThreshold = 50
     public static let passingBatchScore = 4
-    public static let maximumReinforcementRounds = 3
 
     private let historyStore: ChatHistoryStore
     private let learningStore: LearningStore
@@ -460,7 +459,7 @@ public actor LearningEngine {
             successfulCount: successfulCount,
             completedBatchCount: completedBatchCount
         ) {
-        case .reinforce:
+        case .reinforce, .paused:
             diagnosticLogger.event(
                 "learning_reinforcement_started",
                 component: "learn",
@@ -484,14 +483,6 @@ public actor LearningEngine {
                 session: session,
                 outcome: .goodForToday,
                 summary: "本轮 \(successfulCount)/\(batch.count) 通过；这只代表今天掌握，系统会按间隔再次复习。"
-            )
-            return try await startOrResumeSession(apiKey: apiKey, model: model)
-
-        case .paused:
-            _ = try complete(
-                session: session,
-                outcome: .needsReview,
-                summary: "已完成 \(completedBatchCount) 轮强化，本知识点会在明天优先复习，避免疲劳式重复。"
             )
             return try await startOrResumeSession(apiKey: apiKey, model: model)
         }
@@ -1194,14 +1185,12 @@ public actor LearningEngine {
 
     public static func batchOutcome(
         successfulCount: Int,
-        completedBatchCount: Int
+        completedBatchCount _: Int
     ) -> LearningBatchOutcome {
         if successfulCount >= passingBatchScore {
             return .passed
         }
-        return completedBatchCount < maximumReinforcementRounds
-            ? .reinforce
-            : .paused
+        return .reinforce
     }
 
     public static func shouldIntroduceNewMaterial(

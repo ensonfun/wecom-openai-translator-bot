@@ -44,6 +44,9 @@ public struct LearningDebugEntry: Identifiable, Sendable {
     public let tokenUsage: LearningTokenUsage?
     public let status: LearningDebugRequestStatus
     public let attempt: Int
+    public let openAIResponseID: String?
+    public let openAIStatus: String?
+    public let pollCount: Int
     public let startedAt: Date
     public let updatedAt: Date
     public let durationMilliseconds: Int?
@@ -59,6 +62,9 @@ public struct LearningDebugEntry: Identifiable, Sendable {
         tokenUsage: LearningTokenUsage?,
         status: LearningDebugRequestStatus,
         attempt: Int,
+        openAIResponseID: String?,
+        openAIStatus: String?,
+        pollCount: Int,
         startedAt: Date,
         updatedAt: Date,
         durationMilliseconds: Int?,
@@ -73,6 +79,9 @@ public struct LearningDebugEntry: Identifiable, Sendable {
         self.tokenUsage = tokenUsage
         self.status = status
         self.attempt = attempt
+        self.openAIResponseID = openAIResponseID
+        self.openAIStatus = openAIStatus
+        self.pollCount = pollCount
         self.startedAt = startedAt
         self.updatedAt = updatedAt
         self.durationMilliseconds = durationMilliseconds
@@ -113,12 +122,50 @@ public final class LearningDebugStore: @unchecked Sendable {
             tokenUsage: existing?.tokenUsage,
             status: .running,
             attempt: attempt,
+            openAIResponseID: existing?.openAIResponseID,
+            openAIStatus: existing?.openAIStatus,
+            pollCount: existing?.pollCount ?? 0,
             startedAt: existing?.startedAt ?? now,
             updatedAt: now,
             durationMilliseconds: existing?.durationMilliseconds,
             errorMessage: nil
         )
         trimIfNeeded()
+        lock.unlock()
+        notifyObservers()
+    }
+
+    public func backgroundStatusUpdated(
+        requestID: UUID,
+        responseID: String?,
+        status: String?,
+        pollCount: Int,
+        durationMilliseconds: Int
+    ) {
+        let now = Date()
+        lock.lock()
+        guard let existing = entriesByID[requestID] else {
+            lock.unlock()
+            return
+        }
+        entriesByID[requestID] = LearningDebugEntry(
+            id: existing.id,
+            flow: existing.flow,
+            model: existing.model,
+            instructions: existing.instructions,
+            input: existing.input,
+            response: existing.response,
+            tokenUsage: existing.tokenUsage,
+            status: existing.status,
+            attempt: existing.attempt,
+            openAIResponseID: responseID ?? existing.openAIResponseID,
+            openAIStatus: status ?? existing.openAIStatus,
+            pollCount: pollCount,
+            startedAt: existing.startedAt,
+            updatedAt: now,
+            durationMilliseconds: durationMilliseconds,
+            errorMessage: existing.errorMessage
+        )
         lock.unlock()
         notifyObservers()
     }
@@ -203,6 +250,9 @@ public final class LearningDebugStore: @unchecked Sendable {
             tokenUsage: tokenUsage ?? existing.tokenUsage,
             status: status,
             attempt: attempt,
+            openAIResponseID: existing.openAIResponseID,
+            openAIStatus: existing.openAIStatus,
+            pollCount: existing.pollCount,
             startedAt: existing.startedAt,
             updatedAt: now,
             durationMilliseconds: durationMilliseconds,

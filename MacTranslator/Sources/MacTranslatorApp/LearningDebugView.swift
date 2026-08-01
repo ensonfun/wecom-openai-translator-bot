@@ -173,8 +173,25 @@ struct LearningDebugView: View {
             HStack(spacing: 10) {
                 summaryItem(title: "Model", value: entry.model)
                 summaryItem(title: "Attempt", value: "\(entry.attempt)")
+                if let status = entry.openAIStatus {
+                    summaryItem(title: "OpenAI status", value: status)
+                }
+                if entry.pollCount > 0 {
+                    summaryItem(title: "Polls", value: "\(entry.pollCount)")
+                }
                 if let duration = entry.durationMilliseconds {
                     summaryItem(title: "Duration", value: formatDuration(duration))
+                }
+            }
+
+            if let responseID = entry.openAIResponseID {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("OpenAI response ID")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text(responseID)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
                 }
             }
 

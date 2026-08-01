@@ -21,7 +21,9 @@ final class LearningViewModel: ObservableObject {
     private let diagnosticLogger: DiagnosticLogger
     private let learningDebugStore: LearningDebugStore
     private var didStart = false
+    private var startupTask: Task<Void, Never>?
     private var syncTask: Task<Void, Never>?
+    private var workTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
 
     init(
@@ -69,7 +71,9 @@ final class LearningViewModel: ObservableObject {
     }
 
     deinit {
+        startupTask?.cancel()
         syncTask?.cancel()
+        workTask?.cancel()
     }
 
     func start() {
@@ -80,10 +84,12 @@ final class LearningViewModel: ObservableObject {
             component: "learn"
         )
         refreshCredentials()
-        Task {
+        startupTask = Task { [weak self] in
+            guard let self else { return }
             await reload()
             await syncHistoryIfThresholdReached(trigger: "learn_opened")
             await prepareExerciseIfNeeded()
+            startupTask = nil
         }
     }
 
@@ -173,6 +179,14 @@ final class LearningViewModel: ObservableObject {
         }
         isSyncing = false
         isLoading = false
+    }
+
+    func startHistorySync() {
+        guard !isSyncing else { return }
+        syncTask?.cancel()
+        syncTask = Task { [weak self] in
+            await self?.syncHistory()
+        }
     }
 
     func startOrResumeSession() {
@@ -310,6 +324,17 @@ final class LearningViewModel: ObservableObject {
         reloadDebugEntries()
     }
 
+    func cancelCurrentRequest() {
+        guard isWorking || isSyncing else { return }
+        diagnosticLogger.event(
+            "learning_action_cancel_requested",
+            component: "learn"
+        )
+        startupTask?.cancel()
+        syncTask?.cancel()
+        workTask?.cancel()
+    }
+
     var statusText: String {
         guard let dashboard else { return "Loading…" }
         if dashboard.analyzedTurnCount == 0 {
@@ -349,7 +374,8 @@ final class LearningViewModel: ObservableObject {
             component: "learn",
             details: startedDetails
         )
-        Task {
+        workTask = Task { [weak self] in
+            guard let self else { return }
             do {
                 dashboard = try await work(apiKey, resolvedModel)
                 if clearBatchAnswers {
@@ -357,6 +383,17 @@ final class LearningViewModel: ObservableObject {
                 }
                 diagnosticLogger.event(
                     "learning_action_completed",
+                    component: "learn",
+                    details: Self.merging(
+                        details,
+                        with: ["action": .string(action)]
+                    )
+                )
+            } catch is CancellationError {
+                errorMessage = nil
+                diagnosticLogger.event(
+                    "learning_action_cancelled",
+                    level: .warning,
                     component: "learn",
                     details: Self.merging(
                         details,
@@ -377,6 +414,7 @@ final class LearningViewModel: ObservableObject {
                 )
             }
             isWorking = false
+            workTask = nil
         }
     }
 
@@ -438,6 +476,14 @@ final class LearningViewModel: ObservableObject {
                     )
                 ]
             )
+        } catch is CancellationError {
+            errorMessage = nil
+            diagnosticLogger.event(
+                "learning_pending_history_count_cancelled",
+                level: .warning,
+                component: "learn",
+                details: ["trigger": .string(trigger)]
+            )
         } catch {
             errorMessage = error.localizedDescription
             diagnosticLogger.event(
@@ -483,6 +529,14 @@ final class LearningViewModel: ObservableObject {
                 "learning_exercise_preparation_completed",
                 component: "learn",
                 operationID: dashboard?.activeSession?.id
+            )
+        } catch is CancellationError {
+            errorMessage = nil
+            diagnosticLogger.event(
+                "learning_exercise_preparation_cancelled",
+                level: .warning,
+                component: "learn",
+                operationID: session?.id
             )
         } catch {
             errorMessage = error.localizedDescription
