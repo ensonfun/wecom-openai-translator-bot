@@ -24,7 +24,7 @@ public actor LearningEngine {
 
     public func syncHistory(
         apiKey: String,
-        model: String
+        profile: OpenAIModelProfile
     ) async throws -> LearningSyncResult {
         let syncID = UUID()
         let sourceTurns = try historyStore.learningSourceTurns()
@@ -40,7 +40,8 @@ public actor LearningEngine {
                 "source_turn_count": .integer(sourceTurns.count),
                 "already_analyzed_count": .integer(analyzedIDs.count),
                 "pending_turn_count": .integer(pending.count),
-                "model": .string(model)
+                "model": .string(profile.model),
+                "reasoning_effort": .string(profile.reasoningEffort.rawValue)
             ]
         )
         guard !pending.isEmpty else {
@@ -63,7 +64,7 @@ public actor LearningEngine {
             let result = try await analyze(
                 batch,
                 apiKey: apiKey,
-                model: model,
+                profile: profile,
                 operationID: syncID
             )
             let byID = Dictionary(uniqueKeysWithValues: result.turns.map { ($0.turnID, $0) })
@@ -136,7 +137,8 @@ public actor LearningEngine {
                                 eventType.rawValue
                             ].joined(separator: ":"),
                             producer: "history_analyzer",
-                            model: model,
+                            model: profile.model,
+                            reasoningEffort: profile.reasoningEffort,
                             promptVersion: LearningPromptContracts.analyzerVersion,
                             payload: payload
                         )
@@ -162,7 +164,8 @@ public actor LearningEngine {
                             LearningPromptContracts.analyzerVersion
                         ].joined(separator: ":"),
                         producer: "history_analyzer",
-                        model: model,
+                        model: profile.model,
+                        reasoningEffort: profile.reasoningEffort,
                         promptVersion: LearningPromptContracts.analyzerVersion,
                         payload: completion
                     )
@@ -203,7 +206,7 @@ public actor LearningEngine {
 
     public func startOrResumeSession(
         apiKey: String,
-        model: String
+        profile: OpenAIModelProfile
     ) async throws -> LearningDashboard {
         let dashboard = try learningStore.dashboard()
         if let session = dashboard.activeSession {
@@ -221,7 +224,7 @@ public actor LearningEngine {
             return try await recover(
                 session: session,
                 apiKey: apiKey,
-                model: model
+                profile: profile
             )
         }
 
@@ -273,7 +276,7 @@ public actor LearningEngine {
         return try await generateNextQuestion(
             sessionID: sessionID,
             apiKey: apiKey,
-            model: model
+            profile: profile
         )
     }
 
@@ -317,7 +320,7 @@ public actor LearningEngine {
     public func submitAnswer(
         _ answer: String,
         apiKey: String,
-        model: String
+        profile: OpenAIModelProfile
     ) async throws -> LearningDashboard {
         let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
@@ -365,13 +368,13 @@ public actor LearningEngine {
         return try await gradePendingAnswer(
             sessionID: session.id,
             apiKey: apiKey,
-            model: model
+            profile: profile
         )
     }
 
     public func continueSession(
         apiKey: String,
-        model: String
+        profile: OpenAIModelProfile
     ) async throws -> LearningDashboard {
         let dashboard = try learningStore.dashboard()
         guard let session = dashboard.activeSession else {
@@ -381,14 +384,14 @@ public actor LearningEngine {
             return try await generateNextQuestion(
                 sessionID: session.id,
                 apiKey: apiKey,
-                model: model
+                profile: profile
             )
         }
         if last.answer != nil, last.grade == nil {
             return try await gradePendingAnswer(
                 sessionID: session.id,
                 apiKey: apiKey,
-                model: model
+                profile: profile
             )
         }
         if last.grade == nil, !last.skipped {
@@ -420,13 +423,13 @@ public actor LearningEngine {
         return try await generateNextQuestion(
             sessionID: session.id,
             apiKey: apiKey,
-            model: model
+            profile: profile
         )
     }
 
     public func skipQuestion(
         apiKey: String,
-        model: String
+        profile: OpenAIModelProfile
     ) async throws -> LearningDashboard {
         let dashboard = try learningStore.dashboard()
         guard let session = dashboard.activeSession,
@@ -472,7 +475,7 @@ public actor LearningEngine {
         return try await generateNextQuestion(
             sessionID: session.id,
             apiKey: apiKey,
-            model: model
+            profile: profile
         )
     }
 
@@ -529,27 +532,27 @@ public actor LearningEngine {
     private func recover(
         session: LearningSessionSnapshot,
         apiKey: String,
-        model: String
+        profile: OpenAIModelProfile
     ) async throws -> LearningDashboard {
         guard let last = session.attempts.last else {
             return try await generateNextQuestion(
                 sessionID: session.id,
                 apiKey: apiKey,
-                model: model
+                profile: profile
             )
         }
         if last.answer != nil, last.grade == nil {
             return try await gradePendingAnswer(
                 sessionID: session.id,
                 apiKey: apiKey,
-                model: model
+                profile: profile
             )
         }
         if last.skipped {
             return try await generateNextQuestion(
                 sessionID: session.id,
                 apiKey: apiKey,
-                model: model
+                profile: profile
             )
         }
         return try learningStore.dashboard()
@@ -558,7 +561,7 @@ public actor LearningEngine {
     private func analyze(
         _ turns: [LearningSourceTurn],
         apiKey: String,
-        model: String,
+        profile: OpenAIModelProfile,
         operationID: UUID
     ) async throws -> HistoryAnalysisResult {
         let input = HistoryAnalysisInput(
@@ -574,7 +577,8 @@ public actor LearningEngine {
         )
         return try await client.structuredResponse(
             apiKey: apiKey,
-            model: model,
+            model: profile.model,
+            reasoningEffort: profile.reasoningEffort,
             instructions: LearningPromptContracts.historyAnalyzer,
             input: try encodeInput(input),
             schemaName: "english_history_analysis",
@@ -595,7 +599,7 @@ public actor LearningEngine {
     private func generateNextQuestion(
         sessionID: UUID,
         apiKey: String,
-        model: String
+        profile: OpenAIModelProfile
     ) async throws -> LearningDashboard {
         let dashboard = try learningStore.dashboard()
         guard let session = dashboard.activeSession, session.id == sessionID else {
@@ -622,7 +626,8 @@ public actor LearningEngine {
         )
         let generated: GeneratedLearningQuestion = try await client.structuredResponse(
             apiKey: apiKey,
-            model: model,
+            model: profile.model,
+            reasoningEffort: profile.reasoningEffort,
             instructions: LearningPromptContracts.questionGenerator,
             input: try encodeInput(request),
             schemaName: "english_learning_question",
@@ -666,7 +671,8 @@ public actor LearningEngine {
                     LearningPromptContracts.questionVersion
                 ].joined(separator: ":"),
                 producer: "question_generator",
-                model: model,
+                model: profile.model,
+                reasoningEffort: profile.reasoningEffort,
                 promptVersion: LearningPromptContracts.questionVersion,
                 payload: question
             )
@@ -693,7 +699,7 @@ public actor LearningEngine {
     private func gradePendingAnswer(
         sessionID: UUID,
         apiKey: String,
-        model: String
+        profile: OpenAIModelProfile
     ) async throws -> LearningDashboard {
         let dashboard = try learningStore.dashboard()
         guard let session = dashboard.activeSession, session.id == sessionID,
@@ -715,7 +721,8 @@ public actor LearningEngine {
         )
         let generated: GeneratedLearningGrade = try await client.structuredResponse(
             apiKey: apiKey,
-            model: model,
+            model: profile.model,
+            reasoningEffort: profile.reasoningEffort,
             instructions: LearningPromptContracts.answerGrader,
             input: try encodeInput(input),
             schemaName: "english_answer_grade",
@@ -774,7 +781,8 @@ public actor LearningEngine {
                     LearningPromptContracts.graderVersion
                 ].joined(separator: ":"),
                 producer: "answer_grader",
-                model: model,
+                model: profile.model,
+                reasoningEffort: profile.reasoningEffort,
                 promptVersion: LearningPromptContracts.graderVersion,
                 payload: grade
             ),

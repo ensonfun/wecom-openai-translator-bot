@@ -37,7 +37,6 @@ final class ChatViewModel: ObservableObject {
         self.client = client
         self.historyStore = historyStore
         self.diagnosticLogger = diagnosticLogger
-        migrateUnavailablePreviewModel()
 
         do {
             messages = try historyStore.load()
@@ -340,23 +339,6 @@ final class ChatViewModel: ObservableObject {
 
     private func resolvedAPIKey() -> String? {
         SharedOpenAIConfiguration.apiKey(from: keychain)
-    }
-
-    private func migrateUnavailablePreviewModel() {
-        let defaults = UserDefaults.standard
-        let configuredModel = defaults.string(forKey: AppSettings.modelKey)
-        let resolvedModel = AppSettings.resolvedModel(configuredModel)
-        if configuredModel != nil, configuredModel != resolvedModel {
-            defaults.set(resolvedModel, forKey: AppSettings.modelKey)
-            diagnosticLogger.event(
-                "model_setting_migrated",
-                component: "settings",
-                details: [
-                    "previous_model": .string(configuredModel ?? ""),
-                    "resolved_model": .string(resolvedModel)
-                ]
-            )
-        }
     }
 
     private func append(_ delta: String, to id: UUID) {

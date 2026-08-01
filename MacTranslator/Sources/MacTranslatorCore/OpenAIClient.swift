@@ -262,6 +262,7 @@ public struct OpenAIClient: Sendable {
     public func structuredResponse<Output: Decodable & Sendable>(
         apiKey: String,
         model: String,
+        reasoningEffort: OpenAIReasoningEffort? = nil,
         instructions: String,
         input: String,
         schemaName: String,
@@ -273,19 +274,24 @@ public struct OpenAIClient: Sendable {
         outputType: Output.Type = Output.self
     ) async throws -> Output {
         diagnosticLogger.registerSecret(apiKey)
+        var requestDetails: [String: DiagnosticValue] = [
+            "endpoint": .string(endpoint.absoluteString),
+            "store": .boolean(false),
+            "stream": .boolean(false),
+            "max_output_tokens": .integer(maxOutputTokens)
+        ]
+        if let reasoningEffort {
+            requestDetails["reasoning_effort"] = .string(reasoningEffort.rawValue)
+        }
         let requestContext = DiagnosticRequestContext(
             flow: diagnosticContext.flow,
             operationID: diagnosticContext.operationID,
-            details: diagnosticContext.details.merging([
-                "endpoint": .string(endpoint.absoluteString),
-                "store": .boolean(false),
-                "stream": .boolean(false),
-                "max_output_tokens": .integer(maxOutputTokens)
-            ]) { _, new in new }
+            details: diagnosticContext.details.merging(requestDetails) { _, new in new }
         )
         let data = try await structuredResponseData(
             apiKey: apiKey,
             model: model,
+            reasoningEffort: reasoningEffort,
             instructions: instructions,
             input: input,
             schemaName: schemaName,
@@ -315,6 +321,7 @@ public struct OpenAIClient: Sendable {
     private func structuredResponseData(
         apiKey: String,
         model: String,
+        reasoningEffort: OpenAIReasoningEffort?,
         instructions: String,
         input: String,
         schemaName: String,
@@ -350,6 +357,7 @@ public struct OpenAIClient: Sendable {
                 request.httpBody = try JSONEncoder().encode(
                     StructuredResponseRequest(
                         model: model,
+                        reasoning: reasoningEffort.map(ReasoningConfiguration.init),
                         instructions: instructions,
                         input: input,
                         store: false,
@@ -538,6 +546,7 @@ private struct ResponseRequest: Encodable {
 
 private struct StructuredResponseRequest: Encodable {
     let model: String
+    let reasoning: ReasoningConfiguration?
     let instructions: String
     let input: String
     let store: Bool
@@ -546,12 +555,17 @@ private struct StructuredResponseRequest: Encodable {
 
     enum CodingKeys: String, CodingKey {
         case model
+        case reasoning
         case instructions
         case input
         case store
         case maxOutputTokens = "max_output_tokens"
         case text
     }
+}
+
+private struct ReasoningConfiguration: Encodable {
+    let effort: OpenAIReasoningEffort
 }
 
 private struct StructuredTextConfiguration: Encodable {

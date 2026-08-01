@@ -70,7 +70,7 @@ Learn 页面可以单独导出完整的学习事件归档 JSON。
 
 - App 版本、macOS 版本、启动、正常退出与上次异常退出
 - Chat 的命令、prompt、输入、完整或部分模型输出及持久化状态
-- OpenAI 请求阶段、模型、HTTP 状态、request ID、重试、耗时和错误详情
+- OpenAI 请求阶段、模型、reasoning effort、HTTP 状态、request ID、重试、耗时和错误详情
 - Learn 的历史同步、证据提取、出题、答案、判题、讲解和 session 状态
 - SQLite 事件写入、投影重建、Keychain、设置与全局快捷键操作
 - 错误域、错误码、错误说明、源代码位置和调用栈
@@ -83,7 +83,7 @@ App 的界面语言为英文。
 
 Settings 的 Prompts 页面可以查看、修改或恢复 Default、`t` 和 `s` 三个 prompt。Chat 请求只发送当前消息和本次选中的 prompt。Learn 会另外发送尚未分析的少量 `t` / `s` 记录，出题和判题时只发送当前知识点及当前答案，不会发送完整事件归档。
 
-Chat 和 Learn 共用 Settings → OpenAI 中的同一个 API Key 与模型配置，不需要为 Learn 单独配置。
+Chat 和 Learn 共用 Settings → OpenAI 中的同一个 API Key。模型配置按工作负载分开：Chat 使用自己的模型；Learn 的历史分析以及互动出题/判题各自使用独立的模型和 reasoning effort。默认情况下，历史分析使用 `gpt-5.6-terra` + `high`，互动出题和判题使用 `gpt-5.6-luna` + `medium`。
 
 如果 macOS 返回 Keychain 错误 `-25293`，设置页会提供 **Reconnect and Save**。该操作让系统重新连接 login keychain，并由 macOS 自己询问 Mac 登录密码；应用不会读取或保存这段登录密码。
 
@@ -104,7 +104,7 @@ swift run MacTranslator
 
 首次打开后进入“设置”，填写 OpenAI API Key。Key 只会保存到 macOS Keychain，也可以在从终端启动时通过 `OPENAI_API_KEY` 环境变量提供。
 
-默认模型是 `gpt-5.4-mini`，可以在设置中修改。
+Chat 默认模型是 `gpt-5.4-mini`。Learn 默认使用 `gpt-5.6-terra` + `high` 分析历史，使用 `gpt-5.6-luna` + `medium` 出题和判题；这些配置都可以在设置中修改。
 
 ## 生成 `.app`
 

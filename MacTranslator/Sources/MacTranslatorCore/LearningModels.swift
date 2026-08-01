@@ -38,6 +38,7 @@ public struct LearningEventRecord: Identifiable, Codable, Equatable, Sendable {
     public let idempotencyKey: String
     public let producer: String
     public let model: String?
+    public let reasoningEffort: OpenAIReasoningEffort?
     public let promptVersion: String?
     public let payloadJSON: String
 
@@ -57,6 +58,7 @@ public struct LearningEventRecord: Identifiable, Codable, Equatable, Sendable {
         idempotencyKey: String,
         producer: String,
         model: String?,
+        reasoningEffort: OpenAIReasoningEffort?,
         promptVersion: String?,
         payloadJSON: String
     ) {
@@ -75,6 +77,7 @@ public struct LearningEventRecord: Identifiable, Codable, Equatable, Sendable {
         self.idempotencyKey = idempotencyKey
         self.producer = producer
         self.model = model
+        self.reasoningEffort = reasoningEffort
         self.promptVersion = promptVersion
         self.payloadJSON = payloadJSON
     }
@@ -94,6 +97,7 @@ public struct PendingLearningEvent: Sendable {
     public let idempotencyKey: String
     public let producer: String
     public let model: String?
+    public let reasoningEffort: OpenAIReasoningEffort?
     public let promptVersion: String?
     public let payloadJSON: String
 
@@ -111,6 +115,7 @@ public struct PendingLearningEvent: Sendable {
         idempotencyKey: String,
         producer: String,
         model: String? = nil,
+        reasoningEffort: OpenAIReasoningEffort? = nil,
         promptVersion: String? = nil,
         payload: Payload
     ) throws {
@@ -133,6 +138,7 @@ public struct PendingLearningEvent: Sendable {
         self.idempotencyKey = idempotencyKey
         self.producer = producer
         self.model = model
+        self.reasoningEffort = reasoningEffort
         self.promptVersion = promptVersion
         self.payloadJSON = payloadJSON
     }
