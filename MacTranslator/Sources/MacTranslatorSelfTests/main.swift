@@ -20,19 +20,26 @@ final class OpenAIStubURLProtocol: URLProtocol {
         case success(String)
         case partialTextThenConnectionLost(String)
         case structuredSuccess(String)
+        case structuredSuccessWithID(String, responseID: String)
         case structuredIncomplete(String, reason: String)
+        case structuredQueued(String)
+        case structuredInProgress(String)
     }
 
     private static let lock = NSLock()
     private static var outcomes: [Outcome] = []
     private static var requests = 0
     private static var requestBodies: [Data] = []
+    private static var requestMethods: [String] = []
+    private static var requestURLs: [URL] = []
 
     static func configure(_ newOutcomes: [Outcome]) {
         lock.lock()
         outcomes = newOutcomes
         requests = 0
         requestBodies = []
+        requestMethods = []
+        requestURLs = []
         lock.unlock()
     }
 
@@ -48,6 +55,18 @@ final class OpenAIStubURLProtocol: URLProtocol {
         return requestBodies.last
     }
 
+    static var capturedRequestMethods: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return requestMethods
+    }
+
+    static var capturedRequestURLs: [URL] {
+        lock.lock()
+        defer { lock.unlock() }
+        return requestURLs
+    }
+
     override class func canInit(with request: URLRequest) -> Bool { true }
 
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -56,6 +75,10 @@ final class OpenAIStubURLProtocol: URLProtocol {
         let outcome: Outcome
         Self.lock.lock()
         Self.requests += 1
+        Self.requestMethods.append(request.httpMethod ?? "GET")
+        if let url = request.url {
+            Self.requestURLs.append(url)
+        }
         if let body = request.httpBody ?? Self.readBodyStream(request.httpBodyStream) {
             Self.requestBodies.append(body)
         }
@@ -78,11 +101,25 @@ final class OpenAIStubURLProtocol: URLProtocol {
             }
         case .structuredSuccess(let json):
             sendJSONResponse(outputText: json)
+        case .structuredSuccessWithID(let json, let responseID):
+            sendJSONResponse(outputText: json, responseID: responseID)
         case .structuredIncomplete(let json, let reason):
             sendJSONResponse(
                 outputText: json,
                 status: "incomplete",
                 incompleteReason: reason
+            )
+        case .structuredQueued(let responseID):
+            sendJSONResponse(
+                outputText: nil,
+                responseID: responseID,
+                status: "queued"
+            )
+        case .structuredInProgress(let responseID):
+            sendJSONResponse(
+                outputText: nil,
+                responseID: responseID,
+                status: "in_progress"
             )
         }
     }
@@ -128,14 +165,46 @@ final class OpenAIStubURLProtocol: URLProtocol {
     }
 
     private func sendJSONResponse(
-        outputText: String,
+        outputText: String?,
+        responseID: String = "resp_structured_self_test",
         status: String = "completed",
         incompleteReason: String? = nil
     ) {
-        let encodedText = try! JSONEncoder().encode(outputText)
-        let text = String(decoding: encodedText, as: UTF8.self)
+        let encodedResponseID = try! JSONEncoder().encode(responseID)
+        let responseIDText = String(decoding: encodedResponseID, as: UTF8.self)
         let encodedStatus = try! JSONEncoder().encode(status)
         let statusText = String(decoding: encodedStatus, as: UTF8.self)
+        let output: String
+        let usage: String
+        if let outputText {
+            let encodedText = try! JSONEncoder().encode(outputText)
+            let text = String(decoding: encodedText, as: UTF8.self)
+            output = """
+            [{
+              "type": "message",
+              "content": [{
+                "type": "output_text",
+                "text": \(text)
+              }]
+            }]
+            """
+            usage = """
+            {
+              "input_tokens": 111,
+              "input_tokens_details": {
+                "cached_tokens": 11
+              },
+              "output_tokens": 37,
+              "output_tokens_details": {
+                "reasoning_tokens": 7
+              },
+              "total_tokens": 148
+            }
+            """
+        } else {
+            output = "[]"
+            usage = "null"
+        }
         let incompleteDetails: String
         if let incompleteReason {
             let encodedReason = try! JSONEncoder().encode(incompleteReason)
@@ -147,27 +216,12 @@ final class OpenAIStubURLProtocol: URLProtocol {
         let body = Data(
             """
             {
+              "id": \(responseIDText),
               "status": \(statusText),
               "error": null,
               "incomplete_details": \(incompleteDetails),
-              "output": [{
-                "type": "message",
-                "content": [{
-                  "type": "output_text",
-                  "text": \(text)
-                }]
-              }],
-              "usage": {
-                "input_tokens": 111,
-                "input_tokens_details": {
-                  "cached_tokens": 11
-                },
-                "output_tokens": 37,
-                "output_tokens_details": {
-                  "reasoning_tokens": 7
-                },
-                "total_tokens": 148
-              }
+              "output": \(output),
+              "usage": \(usage)
             }
             """.utf8
         )
@@ -382,8 +436,8 @@ expect(
     "一批低于 4/5 会继续相同知识点"
 )
 expect(
-    LearningEngine.batchOutcome(successfulCount: 2, completedBatchCount: 3) == .paused,
-    "连续三轮仍未通过时会暂停到次日而不是无限刷题"
+    LearningEngine.batchOutcome(successfulCount: 2, completedBatchCount: 20) == .reinforce,
+    "当天即使连续多轮未通过也会继续强化同一知识点"
 )
 expect(
     !LearningEngine.shouldIntroduceNewMaterial(
@@ -1205,7 +1259,8 @@ let retryClient = OpenAIClient(
     session: stubSession,
     diagnosticLogger: retryLogger,
     learningDebugStore: learningDebugStore,
-    retryDelayNanoseconds: [0, 0]
+    retryDelayNanoseconds: [0, 0],
+    backgroundPollIntervalNanoseconds: 0
 )
 let secretAPIKey = "sk-self-test-must-not-appear"
 let secretChatText = "private chat body must not appear"
@@ -1234,6 +1289,7 @@ do {
     let formatObject = textObject?["format"] as? [String: Any]
     expect(formatObject?["type"] as? String == "json_schema", "结构化请求使用 text.format JSON Schema")
     expect(requestObject?["store"] as? Bool == false, "学习请求明确关闭服务端响应存储")
+    expect(requestObject?["background"] as? Bool == true, "学习请求启用 Responses background mode")
 
     let debugEntry = learningDebugStore.entries().first
     expect(debugEntry?.instructions == "Return structured JSON.", "Learn Debug 记录输入 prompt")
@@ -1247,6 +1303,80 @@ do {
 } catch {
     failures += 1
     print("✗ 结构化输出自检出错：\(error.localizedDescription)")
+}
+
+do {
+    let responseID = "resp_background_poll_self_test"
+    OpenAIStubURLProtocol.configure([
+        .structuredQueued(responseID),
+        .connectionLostBeforeText,
+        .structuredInProgress(responseID),
+        .structuredSuccessWithID(
+            #"{"value":"completed after polling"}"#,
+            responseID: responseID
+        )
+    ])
+    let structured: StructuredSelfTestOutput = try await retryClient.structuredResponse(
+        apiKey: secretAPIKey,
+        model: "self-test-model",
+        instructions: "Return structured JSON.",
+        input: secretChatText,
+        schemaName: "background_poll_self_test",
+        schema: .strictObject(properties: [
+            "value": .object(["type": .string("string")])
+        ]),
+        diagnosticContext: DiagnosticRequestContext(flow: "learning_background_poll")
+    )
+    expect(
+        structured.value == "completed after polling",
+        "Background response 会轮询到完成后再解码"
+    )
+    let methods = OpenAIStubURLProtocol.capturedRequestMethods
+    expect(methods.filter { $0 == "POST" }.count == 1, "Background 等待期间只创建一次推理")
+    expect(methods.filter { $0 == "GET" }.count == 3, "轮询网络错误只重试 GET 查询")
+    let pollURLs = OpenAIStubURLProtocol.capturedRequestURLs.dropFirst()
+    expect(
+        pollURLs.allSatisfy { $0.path.hasSuffix("/responses/\(responseID)") },
+        "Background 查询始终复用同一个 response ID"
+    )
+    let debugEntry = learningDebugStore.entries().first {
+        $0.flow == "learning_background_poll"
+    }
+    expect(debugEntry?.attempt == 1, "Background 轮询不会显示为第二次模型 attempt")
+    expect(debugEntry?.openAIResponseID == responseID, "Learn Debug 记录 OpenAI response ID")
+    expect(debugEntry?.openAIStatus == "completed", "Learn Debug 记录最终后台状态")
+    expect(debugEntry?.pollCount == 2, "Learn Debug 记录后台轮询次数")
+} catch {
+    failures += 1
+    print("✗ Background mode 轮询自检出错：\(error.localizedDescription)")
+}
+
+do {
+    OpenAIStubURLProtocol.configure([
+        .connectionLostBeforeText,
+        .structuredSuccess(#"{"value":"must not be requested"}"#)
+    ])
+    let _: StructuredSelfTestOutput = try await retryClient.structuredResponse(
+        apiKey: secretAPIKey,
+        model: "self-test-model",
+        instructions: "Return structured JSON.",
+        input: secretChatText,
+        schemaName: "background_create_failure_self_test",
+        schema: .strictObject(properties: [
+            "value": .object(["type": .string("string")])
+        ]),
+        diagnosticContext: DiagnosticRequestContext(
+            flow: "learning_background_create_failure"
+        )
+    )
+    failures += 1
+    print("✗ Background 创建连接丢失应返回错误")
+} catch {
+    expect(
+        OpenAIStubURLProtocol.requestCount == 1
+            && OpenAIStubURLProtocol.capturedRequestMethods == ["POST"],
+        "Background 创建结果不明确时不会重复 POST 并产生重复推理"
+    )
 }
 
 do {

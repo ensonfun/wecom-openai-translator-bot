@@ -32,19 +32,22 @@ public struct OpenAIClient: Sendable {
     private let diagnosticLogger: DiagnosticLogger
     private let learningDebugStore: LearningDebugStore
     private let retryDelayNanoseconds: [UInt64]
+    private let backgroundPollIntervalNanoseconds: UInt64
 
     public init(
         endpoint: URL = URL(string: "https://api.openai.com/v1/responses")!,
         session: URLSession = .shared,
         diagnosticLogger: DiagnosticLogger = .shared,
         learningDebugStore: LearningDebugStore = .shared,
-        retryDelayNanoseconds: [UInt64] = [500_000_000, 1_000_000_000]
+        retryDelayNanoseconds: [UInt64] = [500_000_000, 1_000_000_000],
+        backgroundPollIntervalNanoseconds: UInt64 = 2_000_000_000
     ) {
         self.endpoint = endpoint
         self.session = session
         self.diagnosticLogger = diagnosticLogger
         self.learningDebugStore = learningDebugStore
         self.retryDelayNanoseconds = Array(retryDelayNanoseconds.prefix(2))
+        self.backgroundPollIntervalNanoseconds = backgroundPollIntervalNanoseconds
     }
 
     public func streamResponse(
@@ -292,6 +295,7 @@ public struct OpenAIClient: Sendable {
                 "endpoint": .string(endpoint.absoluteString),
                 "store": .boolean(false),
                 "stream": .boolean(false),
+                "background": .boolean(true),
                 "max_output_tokens": .integer(maxOutputTokens)
             ]) { _, new in new }
         )
@@ -380,165 +384,386 @@ public struct OpenAIClient: Sendable {
     ) async throws -> StructuredResponsePayload {
         let requestID = UUID()
         let startedAt = Date()
-        var attempt = 0
+        let attempt = 1
         var responseText: String?
         var outputText: String?
         var tokenUsage: LearningTokenUsage?
+        var openAIResponseID: String?
+        var openAIStatus: String?
+        var pollCount = 0
         let schemaText = (try? JSONEncoder().encode(schema))
             .flatMap { String(data: $0, encoding: .utf8) }
 
-        while true {
-            attempt += 1
-            responseText = nil
-            outputText = nil
-            tokenUsage = nil
-            diagnosticLogger.requestStarted(
-                requestID: requestID,
-                attempt: attempt,
-                context: diagnosticContext,
-                model: model,
-                instructions: attempt == 1 ? instructions : nil,
-                input: attempt == 1 ? input : nil,
-                schemaName: attempt == 1 ? schemaName : nil,
-                schema: attempt == 1 ? schemaText : nil
-            )
-            learningDebugStore.requestStarted(
-                requestID: requestID,
-                flow: diagnosticContext.flow,
-                model: model,
-                instructions: instructions,
-                input: input,
-                attempt: attempt
-            )
-            do {
-                var request = URLRequest(url: endpoint)
-                request.httpMethod = "POST"
-                request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                request.httpBody = try JSONEncoder().encode(
-                    StructuredResponseRequest(
-                        model: model,
-                        instructions: instructions,
-                        input: input,
-                        store: false,
-                        maxOutputTokens: maxOutputTokens,
-                        text: StructuredTextConfiguration(
-                            format: StructuredTextFormat(
-                                type: "json_schema",
-                                name: schemaName,
-                                strict: true,
-                                schema: schema
-                            )
+        diagnosticLogger.requestStarted(
+            requestID: requestID,
+            attempt: attempt,
+            context: diagnosticContext,
+            model: model,
+            instructions: instructions,
+            input: input,
+            schemaName: schemaName,
+            schema: schemaText
+        )
+        learningDebugStore.requestStarted(
+            requestID: requestID,
+            flow: diagnosticContext.flow,
+            model: model,
+            instructions: instructions,
+            input: input,
+            attempt: attempt
+        )
+
+        do {
+            var request = URLRequest(url: endpoint)
+            request.httpMethod = "POST"
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONEncoder().encode(
+                StructuredResponseRequest(
+                    model: model,
+                    instructions: instructions,
+                    input: input,
+                    store: false,
+                    background: true,
+                    maxOutputTokens: maxOutputTokens,
+                    text: StructuredTextConfiguration(
+                        format: StructuredTextFormat(
+                            type: "json_schema",
+                            name: schemaName,
+                            strict: true,
+                            schema: schema
                         )
                     )
                 )
+            )
 
-                let (data, response) = try await session.data(for: request)
-                responseText = String(data: data, encoding: .utf8)
-                guard let httpResponse = response as? HTTPURLResponse else {
+            let initialResult = try await sendBackgroundRequest(request)
+            responseText = String(data: initialResult.data, encoding: .utf8)
+            diagnosticLogger.responseReceived(
+                requestID: requestID,
+                attempt: attempt,
+                statusCode: initialResult.response.statusCode,
+                openAIRequestID: initialResult.response.value(
+                    forHTTPHeaderField: "x-request-id"
+                ),
+                headers: Self.responseHeaders(initialResult.response),
+                context: diagnosticContext
+            )
+
+            var envelope = initialResult.envelope
+            openAIResponseID = envelope.id
+            openAIStatus = envelope.status
+            updateBackgroundStatus(
+                requestID: requestID,
+                responseID: openAIResponseID,
+                status: openAIStatus,
+                pollCount: pollCount,
+                startedAt: startedAt,
+                context: diagnosticContext
+            )
+
+            while Self.isBackgroundResponsePending(envelope.status) {
+                guard let responseID = envelope.id ?? openAIResponseID else {
                     throw OpenAIClientError.invalidResponse
                 }
-                diagnosticLogger.responseReceived(
-                    requestID: requestID,
-                    attempt: attempt,
-                    statusCode: httpResponse.statusCode,
-                    openAIRequestID: httpResponse.value(forHTTPHeaderField: "x-request-id"),
-                    headers: Self.responseHeaders(httpResponse),
-                    context: diagnosticContext
-                )
-                guard (200..<300).contains(httpResponse.statusCode) else {
-                    let envelope = try? JSONDecoder().decode(APIErrorEnvelope.self, from: data)
-                    let fallback = String(data: data, encoding: .utf8) ?? "Unknown error"
-                    throw OpenAIClientError.api(
-                        statusCode: httpResponse.statusCode,
-                        message: envelope?.error.message ?? fallback
+                openAIResponseID = responseID
+                try Task.checkCancellation()
+                if backgroundPollIntervalNanoseconds > 0 {
+                    try await Task.sleep(
+                        nanoseconds: backgroundPollIntervalNanoseconds
                     )
                 }
+                try Task.checkCancellation()
+                pollCount += 1
+                let pollResult = try await retrieveBackgroundResponse(
+                    responseID: responseID,
+                    apiKey: apiKey,
+                    requestID: requestID,
+                    pollCount: pollCount,
+                    context: diagnosticContext
+                )
+                responseText = String(data: pollResult.data, encoding: .utf8)
+                envelope = pollResult.envelope
+                openAIStatus = envelope.status
+                updateBackgroundStatus(
+                    requestID: requestID,
+                    responseID: responseID,
+                    status: envelope.status,
+                    pollCount: pollCount,
+                    startedAt: startedAt,
+                    context: diagnosticContext
+                )
+            }
 
-                let envelope = try JSONDecoder().decode(StructuredResponseEnvelope.self, from: data)
-                if let error = envelope.error {
-                    throw OpenAIClientError.stream(error.message)
-                }
-                tokenUsage = Self.learningTokenUsage(from: envelope.usage)
-                outputText = Self.structuredOutputText(from: envelope)
-                if envelope.status == "incomplete" {
-                    let reason = envelope.incompleteDetails?.reason ?? "unknown reason"
-                    throw StructuredContentFailure.incomplete(reason: reason)
-                }
-                for output in envelope.output {
-                    guard output.type == "message" else { continue }
-                    for content in output.content {
-                        if content.type == "refusal", let refusal = content.refusal {
-                            throw OpenAIClientError.stream(refusal)
-                        }
-                        if content.type == "output_text", let text = content.text,
-                           let outputData = text.data(using: .utf8) {
-                            let durationMilliseconds = Self.elapsedMilliseconds(
-                                since: startedAt
-                            )
-                            diagnosticLogger.requestCompleted(
-                                requestID: requestID,
-                                attempt: attempt,
-                                receivedText: true,
-                                durationMilliseconds: durationMilliseconds,
-                                outputText: text,
-                                tokenUsage: tokenUsage,
-                                context: diagnosticContext
-                            )
-                            learningDebugStore.requestCompleted(
-                                requestID: requestID,
-                                response: text,
-                                tokenUsage: tokenUsage,
-                                attempt: attempt,
-                                durationMilliseconds: durationMilliseconds
-                            )
-                            return StructuredResponsePayload(
-                                requestID: requestID,
-                                data: outputData,
-                                transportAttempt: attempt,
-                                durationMilliseconds: durationMilliseconds
-                            )
-                        }
+            tokenUsage = Self.learningTokenUsage(from: envelope.usage)
+            outputText = Self.structuredOutputText(from: envelope)
+            if let error = envelope.error {
+                throw OpenAIClientError.stream(error.message)
+            }
+            switch envelope.status {
+            case "incomplete":
+                let reason = envelope.incompleteDetails?.reason ?? "unknown reason"
+                throw StructuredContentFailure.incomplete(reason: reason)
+            case "failed":
+                throw OpenAIClientError.stream(
+                    "OpenAI could not complete the background response."
+                )
+            case "cancelled", "canceled":
+                throw OpenAIClientError.stream(
+                    "The OpenAI background response was cancelled."
+                )
+            case "queued", "in_progress":
+                throw OpenAIClientError.invalidResponse
+            default:
+                break
+            }
+
+            for output in envelope.output {
+                guard output.type == "message" else { continue }
+                for content in output.content {
+                    if content.type == "refusal", let refusal = content.refusal {
+                        throw OpenAIClientError.stream(refusal)
+                    }
+                    if content.type == "output_text", let text = content.text,
+                       let outputData = text.data(using: .utf8) {
+                        let durationMilliseconds = Self.elapsedMilliseconds(
+                            since: startedAt
+                        )
+                        diagnosticLogger.requestCompleted(
+                            requestID: requestID,
+                            attempt: attempt,
+                            receivedText: true,
+                            durationMilliseconds: durationMilliseconds,
+                            outputText: text,
+                            tokenUsage: tokenUsage,
+                            context: diagnosticContext
+                        )
+                        learningDebugStore.requestCompleted(
+                            requestID: requestID,
+                            response: text,
+                            tokenUsage: tokenUsage,
+                            attempt: attempt,
+                            durationMilliseconds: durationMilliseconds
+                        )
+                        return StructuredResponsePayload(
+                            requestID: requestID,
+                            data: outputData,
+                            transportAttempt: attempt,
+                            durationMilliseconds: durationMilliseconds
+                        )
                     }
                 }
-                throw OpenAIClientError.invalidResponse
-            } catch {
-                let failure = Self.diagnosticFailure(for: error)
-                let retryIndex = attempt - 1
-                if Self.isRetryable(error),
-                   retryIndex < retryDelayNanoseconds.count,
-                   !Task.isCancelled {
-                    let delay = retryDelayNanoseconds[retryIndex]
-                    diagnosticLogger.retryScheduled(
-                        requestID: requestID,
-                        attempt: attempt,
-                        delayMilliseconds: Int(delay / 1_000_000),
-                        failure: failure,
-                        context: diagnosticContext
-                    )
-                    try await Task.sleep(nanoseconds: delay)
-                    continue
-                }
-                diagnosticLogger.requestFailed(
+            }
+            throw OpenAIClientError.invalidResponse
+        } catch {
+            let wasCancelled = Task.isCancelled || error is CancellationError
+            if wasCancelled, let openAIResponseID {
+                await cancelBackgroundResponse(
+                    responseID: openAIResponseID,
+                    apiKey: apiKey,
                     requestID: requestID,
-                    attempt: attempt,
-                    receivedText: outputText?.isEmpty == false,
-                    durationMilliseconds: Self.elapsedMilliseconds(since: startedAt),
-                    failure: failure,
-                    outputText: outputText ?? responseText,
                     context: diagnosticContext
                 )
-                learningDebugStore.requestFailed(
-                    requestID: requestID,
-                    response: outputText ?? responseText,
-                    tokenUsage: tokenUsage,
-                    attempt: attempt,
-                    durationMilliseconds: Self.elapsedMilliseconds(since: startedAt),
-                    errorMessage: error.localizedDescription
+            }
+            let reportedError: Error = wasCancelled ? CancellationError() : error
+            let failure = Self.diagnosticFailure(for: reportedError)
+            diagnosticLogger.requestFailed(
+                requestID: requestID,
+                attempt: attempt,
+                receivedText: outputText?.isEmpty == false,
+                durationMilliseconds: Self.elapsedMilliseconds(since: startedAt),
+                failure: failure,
+                outputText: outputText ?? responseText,
+                context: diagnosticContext
+            )
+            learningDebugStore.requestFailed(
+                requestID: requestID,
+                response: outputText ?? responseText,
+                tokenUsage: tokenUsage,
+                attempt: attempt,
+                durationMilliseconds: Self.elapsedMilliseconds(since: startedAt),
+                errorMessage: wasCancelled
+                    ? "The Learn background request was cancelled."
+                    : error.localizedDescription
+            )
+            throw reportedError
+        }
+    }
+
+    private func sendBackgroundRequest(
+        _ request: URLRequest
+    ) async throws -> BackgroundResponseResult {
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw OpenAIClientError.invalidResponse
+        }
+        try Self.validateBackgroundHTTPResponse(httpResponse, data: data)
+        return BackgroundResponseResult(
+            data: data,
+            response: httpResponse,
+            envelope: try JSONDecoder().decode(
+                StructuredResponseEnvelope.self,
+                from: data
+            )
+        )
+    }
+
+    private func retrieveBackgroundResponse(
+        responseID: String,
+        apiKey: String,
+        requestID: UUID,
+        pollCount: Int,
+        context: DiagnosticRequestContext
+    ) async throws -> BackgroundResponseResult {
+        let responseURL = endpoint.appendingPathComponent(responseID)
+        var transportAttempt = 0
+
+        while true {
+            transportAttempt += 1
+            do {
+                var request = URLRequest(url: responseURL)
+                request.httpMethod = "GET"
+                request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+                let result = try await sendBackgroundRequest(request)
+                diagnosticLogger.event(
+                    "background_response_poll_received",
+                    level: .debug,
+                    component: "openai",
+                    operationID: context.operationID,
+                    details: [
+                        "flow": .string(context.flow),
+                        "request_id": .string(requestID.uuidString),
+                        "response_id": .string(responseID),
+                        "status": .string(result.envelope.status ?? "unknown"),
+                        "poll_count": .integer(pollCount),
+                        "transport_attempt": .integer(transportAttempt),
+                        "http_status": .integer(result.response.statusCode)
+                    ]
                 )
-                throw error
+                return result
+            } catch {
+                let retryIndex = transportAttempt - 1
+                guard Self.isRetryable(error),
+                      retryIndex < retryDelayNanoseconds.count,
+                      !Task.isCancelled else {
+                    throw error
+                }
+                let delay = retryDelayNanoseconds[retryIndex]
+                diagnosticLogger.event(
+                    "background_response_poll_retry_scheduled",
+                    level: .warning,
+                    component: "openai",
+                    operationID: context.operationID,
+                    failure: Self.diagnosticFailure(for: error),
+                    details: [
+                        "flow": .string(context.flow),
+                        "request_id": .string(requestID.uuidString),
+                        "response_id": .string(responseID),
+                        "poll_count": .integer(pollCount),
+                        "transport_attempt": .integer(transportAttempt),
+                        "delay_ms": .integer(Int(delay / 1_000_000))
+                    ]
+                )
+                try await Task.sleep(nanoseconds: delay)
             }
         }
+    }
+
+    private func updateBackgroundStatus(
+        requestID: UUID,
+        responseID: String?,
+        status: String?,
+        pollCount: Int,
+        startedAt: Date,
+        context: DiagnosticRequestContext
+    ) {
+        learningDebugStore.backgroundStatusUpdated(
+            requestID: requestID,
+            responseID: responseID,
+            status: status,
+            pollCount: pollCount,
+            durationMilliseconds: Self.elapsedMilliseconds(since: startedAt)
+        )
+        diagnosticLogger.event(
+            pollCount == 0
+                ? "background_response_created"
+                : "background_response_status_updated",
+            component: "openai",
+            operationID: context.operationID,
+            details: [
+                "flow": .string(context.flow),
+                "request_id": .string(requestID.uuidString),
+                "response_id": .string(responseID ?? "unknown"),
+                "status": .string(status ?? "unknown"),
+                "poll_count": .integer(pollCount)
+            ]
+        )
+    }
+
+    private func cancelBackgroundResponse(
+        responseID: String,
+        apiKey: String,
+        requestID: UUID,
+        context: DiagnosticRequestContext
+    ) async {
+        let cancelURL = endpoint
+            .appendingPathComponent(responseID)
+            .appendingPathComponent("cancel")
+        let session = session
+        let diagnosticLogger = diagnosticLogger
+        let operationID = context.operationID
+        let flow = context.flow
+        await Task.detached(priority: .utility) {
+            do {
+                var request = URLRequest(url: cancelURL)
+                request.httpMethod = "POST"
+                request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+                let (_, response) = try await session.data(for: request)
+                let statusCode = (response as? HTTPURLResponse)?.statusCode
+                diagnosticLogger.event(
+                    "background_response_cancel_requested",
+                    component: "openai",
+                    operationID: operationID,
+                    details: [
+                        "flow": .string(flow),
+                        "request_id": .string(requestID.uuidString),
+                        "response_id": .string(responseID),
+                        "http_status": .integer(statusCode ?? 0)
+                    ]
+                )
+            } catch {
+                diagnosticLogger.event(
+                    "background_response_cancel_failed",
+                    level: .warning,
+                    component: "openai",
+                    operationID: operationID,
+                    failure: Self.diagnosticFailure(for: error),
+                    details: [
+                        "flow": .string(flow),
+                        "request_id": .string(requestID.uuidString),
+                        "response_id": .string(responseID)
+                    ]
+                )
+            }
+        }.value
+    }
+
+    private static func validateBackgroundHTTPResponse(
+        _ response: HTTPURLResponse,
+        data: Data
+    ) throws {
+        guard (200..<300).contains(response.statusCode) else {
+            let envelope = try? JSONDecoder().decode(APIErrorEnvelope.self, from: data)
+            let fallback = String(data: data, encoding: .utf8) ?? "Unknown error"
+            throw OpenAIClientError.api(
+                statusCode: response.statusCode,
+                message: envelope?.error.message ?? fallback
+            )
+        }
+    }
+
+    private static func isBackgroundResponsePending(_ status: String?) -> Bool {
+        status == "queued" || status == "in_progress"
     }
 
     public static func isRetryable(_ error: Error) -> Bool {
@@ -713,6 +938,7 @@ private struct StructuredResponseRequest: Encodable {
     let instructions: String
     let input: String
     let store: Bool
+    let background: Bool
     let maxOutputTokens: Int
     let text: StructuredTextConfiguration
 
@@ -721,6 +947,7 @@ private struct StructuredResponseRequest: Encodable {
         case instructions
         case input
         case store
+        case background
         case maxOutputTokens = "max_output_tokens"
         case text
     }
@@ -738,6 +965,7 @@ private struct StructuredTextFormat: Encodable {
 }
 
 private struct StructuredResponseEnvelope: Decodable {
+    let id: String?
     let status: String?
     let error: APIErrorDetail?
     let incompleteDetails: StructuredIncompleteDetails?
@@ -745,12 +973,38 @@ private struct StructuredResponseEnvelope: Decodable {
     let usage: StructuredResponseUsage?
 
     enum CodingKeys: String, CodingKey {
+        case id
         case status
         case error
         case incompleteDetails = "incomplete_details"
         case output
         case usage
     }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id)
+        status = try container.decodeIfPresent(String.self, forKey: .status)
+        error = try container.decodeIfPresent(APIErrorDetail.self, forKey: .error)
+        incompleteDetails = try container.decodeIfPresent(
+            StructuredIncompleteDetails.self,
+            forKey: .incompleteDetails
+        )
+        output = try container.decodeIfPresent(
+            [StructuredOutputItem].self,
+            forKey: .output
+        ) ?? []
+        usage = try container.decodeIfPresent(
+            StructuredResponseUsage.self,
+            forKey: .usage
+        )
+    }
+}
+
+private struct BackgroundResponseResult {
+    let data: Data
+    let response: HTTPURLResponse
+    let envelope: StructuredResponseEnvelope
 }
 
 private struct StructuredResponsePayload {

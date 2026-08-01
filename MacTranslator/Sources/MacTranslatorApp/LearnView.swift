@@ -83,6 +83,18 @@ struct LearnView: View {
 
             Spacer()
 
+            if viewModel.isWorking || viewModel.isSyncing {
+                Button {
+                    viewModel.cancelCurrentRequest()
+                } label: {
+                    Image(systemName: "stop.circle.fill")
+                        .foregroundStyle(.red)
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.plain)
+                .help("Cancel the current Learn request")
+            }
+
             Button {
                 viewModel.reloadDebugEntries()
                 isShowingDebug = true
@@ -94,7 +106,7 @@ struct LearnView: View {
             .help("Show Learn debug information")
 
             Button {
-                Task { await viewModel.syncHistory() }
+                viewModel.startHistorySync()
             } label: {
                 Image(systemName: "arrow.triangle.2.circlepath")
                     .frame(width: 28, height: 28)
@@ -373,17 +385,11 @@ struct LearnView: View {
                 + nextReviewText
             color = .green
             icon = "calendar.badge.checkmark"
-        case .reinforce:
+        case .reinforce, .paused:
             message = "\(successfulCount)/\(batch.count) passed. The next batch will keep "
                 + "this skill and target the issues above with fresh variations."
             color = .orange
             icon = "arrow.triangle.2.circlepath"
-        case .paused:
-            message = "\(successfulCount)/\(batch.count) passed after three rounds. "
-                + "This skill is scheduled for priority review."
-                + nextReviewText
-            color = .orange
-            icon = "calendar.badge.clock"
         }
         return Label(message, systemImage: icon)
             .font(.callout.weight(.medium))
