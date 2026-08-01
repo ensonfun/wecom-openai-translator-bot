@@ -3,7 +3,7 @@ import SQLite3
 
 public struct LearningStore: Sendable {
     public static let projectorName = "learning_core"
-    public static let projectorVersion = 1
+    public static let projectorVersion = 2
 
     public let databaseURL: URL
     private let diagnosticLogger: DiagnosticLogger
@@ -898,6 +898,10 @@ private struct MutableKnowledge {
     var sourceExcerpt = ""
     var correctedForm = ""
     var explanationZH = ""
+    var reviewStage = 0
+    var successfulReviewCount = 0
+    var lastReviewedAt: Date?
+    var lastReviewPassed = false
 
     var snapshot: KnowledgePointSnapshot {
         KnowledgePointSnapshot(
@@ -916,7 +920,11 @@ private struct MutableKnowledge {
             lastEvidenceAt: lastEvidenceAt,
             sourceExcerpt: sourceExcerpt,
             correctedForm: correctedForm,
-            explanationZH: explanationZH
+            explanationZH: explanationZH,
+            reviewStage: reviewStage,
+            successfulReviewCount: successfulReviewCount,
+            lastReviewedAt: lastReviewedAt,
+            lastReviewPassed: lastReviewPassed
         )
     }
 }
@@ -983,6 +991,7 @@ private enum ProjectionReducer {
                 session.focusKnowledgePointID = payload.knowledgePointID
                 session.focusTitle = payload.title
                 session.focusReason = payload.reason
+                session.focusPlanKind = payload.planKind
                 session.updatedAt = event.occurredAt
                 state.sessions[payload.sessionID] = session
                 ensureKnowledge(payload.knowledgePointID, title: payload.title, state: &state)
@@ -1049,6 +1058,14 @@ private enum ProjectionReducer {
                 }
                 applyGrade(payload, event: event, state: &state)
 
+            case .batchReviewCompleted:
+                let payload = try decode(
+                    BatchReviewCompletedPayload.self,
+                    event: event,
+                    decoder: decoder
+                )
+                applyBatchReview(payload, state: &state)
+
             case .questionSkipped:
                 let payload = try decode(
                     QuestionSkippedPayload.self,
@@ -1110,6 +1127,10 @@ private enum ProjectionReducer {
                         knowledge.hasFreeProduction = false
                         knowledge.hasDelayedSuccess = false
                         knowledge.lastSuccessAt = nil
+                        knowledge.reviewStage = 0
+                        knowledge.successfulReviewCount = 0
+                        knowledge.lastReviewedAt = nil
+                        knowledge.lastReviewPassed = false
                         knowledge.mastery = min(
                             0.70,
                             max(
@@ -1197,6 +1218,7 @@ private enum ProjectionReducer {
         event: LearningEventRecord,
         state: inout ProjectionState
     ) {
+        guard payload.countsTowardMastery else { return }
         ensureKnowledge(payload.knowledgePointID, title: "", state: &state)
         guard var knowledge = state.knowledge[payload.knowledgePointID],
               let baseScore = payload.verdict.baseScore else {
@@ -1252,15 +1274,100 @@ private enum ProjectionReducer {
         }
 
         if knowledge.mastery >= 0.85,
-           knowledge.successfulAttempts >= 3,
+           knowledge.successfulAttempts >= 4,
            knowledge.successSessions.count >= 2,
-           knowledge.successfulQuestionTypes.count >= 2,
            knowledge.hasFreeProduction,
            knowledge.hasDelayedSuccess {
             knowledge.lifecycle = .maintained
         } else if knowledge.mastery >= 0.78, knowledge.successfulAttempts >= 2 {
             knowledge.lifecycle = .masteryCandidate
         }
+        state.knowledge[payload.knowledgePointID] = knowledge
+    }
+
+    private static func applyBatchReview(
+        _ payload: BatchReviewCompletedPayload,
+        state: inout ProjectionState
+    ) {
+        ensureKnowledge(payload.knowledgePointID, title: "", state: &state)
+        guard var knowledge = state.knowledge[payload.knowledgePointID] else {
+            return
+        }
+
+        let questionCount = max(1, payload.questionCount)
+        let successfulCount = min(questionCount, max(0, payload.successfulCount))
+        let score = Double(successfulCount) / Double(questionCount)
+        let passed = payload.outcome == .passed
+        let previousReviewedAt = knowledge.lastReviewedAt
+        let previousDueAt = knowledge.dueAt
+        let sameCalendarDay = previousReviewedAt.map {
+            Calendar.current.isDate($0, inSameDayAs: payload.completedAt)
+        } ?? false
+        let wasDue = previousDueAt.map { $0 <= payload.completedAt } ?? true
+
+        let learningRate = passed ? 0.22 : 0.30
+        knowledge.mastery += learningRate * (score - knowledge.mastery)
+        knowledge.mastery = min(1, max(0, knowledge.mastery))
+        knowledge.weightedEvidenceCount += 1
+        knowledge.confidence = confidence(for: knowledge.weightedEvidenceCount)
+        knowledge.lastEvidenceAt = payload.completedAt
+
+        if passed {
+            let canAdvanceInterval = previousReviewedAt != nil
+                && !sameCalendarDay
+                && knowledge.lastReviewPassed
+                && wasDue
+            if canAdvanceInterval {
+                knowledge.reviewStage = min(
+                    knowledge.reviewStage + 1,
+                    reviewIntervals.count - 1
+                )
+            }
+
+            knowledge.successfulReviewCount += 1
+            knowledge.successfulAttempts += 1
+            knowledge.successSessions.insert(payload.sessionID)
+            knowledge.successfulQuestionTypes.insert(.chineseToEnglish)
+            knowledge.hasFreeProduction = true
+            if let lastSuccessAt = knowledge.lastSuccessAt,
+               payload.completedAt.timeIntervalSince(lastSuccessAt) >= 3 * 86_400 {
+                knowledge.hasDelayedSuccess = true
+            }
+            knowledge.lastSuccessAt = payload.completedAt
+            knowledge.lastReviewPassed = true
+
+            if previousDueAt == nil || wasDue || sameCalendarDay {
+                knowledge.dueAt = Calendar.current.date(
+                    byAdding: .day,
+                    value: reviewIntervals[knowledge.reviewStage],
+                    to: payload.completedAt
+                )
+            }
+
+            if knowledge.reviewStage >= 5, knowledge.mastery >= 0.80 {
+                knowledge.lifecycle = .maintained
+            } else if knowledge.reviewStage >= 3 {
+                knowledge.lifecycle = .masteryCandidate
+            } else {
+                knowledge.lifecycle = .consolidating
+            }
+        } else {
+            knowledge.lapseCount += 1
+            if successfulCount <= 2 {
+                knowledge.reviewStage = 0
+            }
+            knowledge.lastReviewPassed = false
+            knowledge.lifecycle = knowledge.successfulReviewCount > 0
+                ? .lapsed
+                : .learning
+            knowledge.dueAt = Calendar.current.date(
+                byAdding: .day,
+                value: 1,
+                to: payload.completedAt
+            )
+        }
+
+        knowledge.lastReviewedAt = payload.completedAt
         state.knowledge[payload.knowledgePointID] = knowledge
     }
 
@@ -1282,6 +1389,8 @@ private enum ProjectionReducer {
     private static func confidence(for weightedEvidence: Double) -> Double {
         min(1, max(0, 1 - Foundation.exp(-weightedEvidence / 4)))
     }
+
+    private static let reviewIntervals = [1, 3, 7, 14, 30, 60, 120]
 
     private static func decode<T: Decodable>(
         _ type: T.Type,

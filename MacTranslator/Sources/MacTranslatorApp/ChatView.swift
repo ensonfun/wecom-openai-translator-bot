@@ -5,6 +5,7 @@ import SwiftUI
 struct ChatView: View {
     @StateObject private var viewModel = ChatViewModel()
     @State private var showingClearConfirmation = false
+    @State private var showingHistoryBrowser = false
     @State private var composerFocused = false
     @AppStorage(AppSettings.composerHeightKey) private var composerHeight = 190.0
     @State private var composerHeightAtDragStart: Double?
@@ -52,6 +53,18 @@ struct ChatView: View {
             Text(
                 "This permanently removes the raw conversation. Your learning profile and sanitized learning examples remain until you delete them in Settings."
             )
+        }
+        .sheet(isPresented: $showingHistoryBrowser) {
+            ChatHistoryBrowserView(
+                messages: viewModel.fullHistoryMessages,
+                isLoading: viewModel.isLoadingFullHistory,
+                onReload: {
+                    viewModel.loadFullHistory(forceReload: true)
+                }
+            )
+            .onAppear {
+                viewModel.loadFullHistory()
+            }
         }
     }
 
@@ -146,7 +159,7 @@ struct ChatView: View {
                     .frame(width: 28, height: 28)
             }
             .buttonStyle(.plain)
-            .disabled(viewModel.messages.isEmpty)
+            .disabled(!viewModel.hasHistory)
             .help("Export chat history as JSON")
 
         }
@@ -167,7 +180,7 @@ struct ChatView: View {
                     .font(.caption)
             }
             .buttonStyle(.borderless)
-            .disabled(viewModel.messages.isEmpty)
+            .disabled(!viewModel.hasHistory)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 10)
@@ -195,6 +208,32 @@ struct ChatView: View {
                     emptyState
                 } else {
                     LazyVStack(spacing: 16) {
+                        if viewModel.hasOlderMessages {
+                            Button {
+                                viewModel.loadFullHistory()
+                                showingHistoryBrowser = true
+                            } label: {
+                                HStack(spacing: 8) {
+                                    Image(systemName: "clock.arrow.circlepath")
+                                    Text(
+                                        "View all \(viewModel.totalMessageCount.formatted()) messages"
+                                    )
+                                        .fontWeight(.semibold)
+                                    Image(systemName: "arrow.up.right.square")
+                                        .font(.caption)
+                                }
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 9)
+                                .background(
+                                    Color(nsColor: .controlBackgroundColor),
+                                    in: Capsule()
+                                )
+                            }
+                            .buttonStyle(.plain)
+                            .help("Browse and search your complete chat history")
+                        }
+
                         ForEach(viewModel.messages) { message in
                             MessageBubble(message: message)
                                 .id(message.id)
@@ -202,6 +241,12 @@ struct ChatView: View {
                     }
                     .padding(.horizontal, 24)
                     .padding(.vertical, 22)
+                }
+            }
+            .onAppear {
+                guard let lastID = viewModel.messages.last?.id else { return }
+                DispatchQueue.main.async {
+                    proxy.scrollTo(lastID, anchor: .bottom)
                 }
             }
             .onChange(of: viewModel.messages.last?.text) { _, _ in

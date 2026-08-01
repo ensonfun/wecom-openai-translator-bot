@@ -14,6 +14,7 @@ public enum LearningEventType: String, Codable, CaseIterable, Sendable {
     case hintRequested = "hint_requested"
     case answerSubmitted = "answer_submitted"
     case answerGraded = "answer_graded"
+    case batchReviewCompleted = "batch_review_completed"
     case explanationPresented = "explanation_presented"
     case questionSkipped = "question_skipped"
     case learningSessionPaused = "learning_session_paused"
@@ -234,10 +235,26 @@ public struct AnalyzedTurn: Codable, Equatable, Sendable {
         case isProficiencyEvidence = "is_proficiency_evidence"
         case evidence
     }
+
+    public init(
+        turnID: UUID,
+        inputLanguage: LearningInputLanguage,
+        isProficiencyEvidence: Bool,
+        evidence: [AnalyzedEvidence]
+    ) {
+        self.turnID = turnID
+        self.inputLanguage = inputLanguage
+        self.isProficiencyEvidence = isProficiencyEvidence
+        self.evidence = evidence
+    }
 }
 
 public struct HistoryAnalysisResult: Codable, Equatable, Sendable {
     public let turns: [AnalyzedTurn]
+
+    public init(turns: [AnalyzedTurn]) {
+        self.turns = turns
+    }
 }
 
 public struct SourceTurnAnalysisCompletedPayload: Codable, Equatable, Sendable {
@@ -339,9 +356,13 @@ public enum LearningQuestionType: String, Codable, CaseIterable, Sendable {
         case .fillBlank: 0.50
         case .sentenceRepair: 0.65
         case .guidedRewrite: 0.75
-        case .chineseToEnglish: 0.85
+        case .chineseToEnglish: 1.0
         case .freeProduction: 1.0
         }
+    }
+
+    public var isLegacy: Bool {
+        self != .chineseToEnglish
     }
 }
 
@@ -379,11 +400,21 @@ public struct GeneratedLearningQuestion: Codable, Equatable, Sendable {
     }
 }
 
+public struct GeneratedLearningQuestionBatch: Codable, Equatable, Sendable {
+    public let questions: [GeneratedLearningQuestion]
+
+    public init(questions: [GeneratedLearningQuestion]) {
+        self.questions = questions
+    }
+}
+
 public struct QuestionPresentedPayload: Codable, Equatable, Sendable, Identifiable {
     public let id: UUID
     public let sessionID: UUID
     public let ordinal: Int
     public let knowledgePointID: String
+    public let batchID: UUID?
+    public let batchIndex: Int?
     public let type: LearningQuestionType
     public let prompt: String
     public let context: String
@@ -396,12 +427,16 @@ public struct QuestionPresentedPayload: Codable, Equatable, Sendable, Identifiab
         sessionID: UUID,
         ordinal: Int,
         knowledgePointID: String,
-        generated: GeneratedLearningQuestion
+        generated: GeneratedLearningQuestion,
+        batchID: UUID? = nil,
+        batchIndex: Int? = nil
     ) {
         self.id = id
         self.sessionID = sessionID
         self.ordinal = ordinal
         self.knowledgePointID = knowledgePointID
+        self.batchID = batchID
+        self.batchIndex = batchIndex
         type = generated.type
         prompt = generated.prompt
         context = generated.context
@@ -420,11 +455,11 @@ public enum LearningVerdict: String, Codable, CaseIterable, Sendable {
 
     public var title: String {
         switch self {
-        case .correct: "Correct"
-        case .acceptable: "Acceptable"
-        case .needsImprovement: "Needs improvement"
-        case .incorrect: "Incorrect"
-        case .ungradable: "Needs another look"
+        case .correct: "Natural expression"
+        case .acceptable: "Mostly right"
+        case .needsImprovement: "Needs adjustment"
+        case .incorrect: "Needs adjustment"
+        case .ungradable: "Try another prompt"
         }
     }
 
@@ -447,13 +482,34 @@ public enum LearningFollowUp: String, Codable, CaseIterable, Sendable {
     case none
 }
 
+public struct LearningSentencePattern: Codable, Equatable, Sendable {
+    public let pattern: String
+    public let meaningZH: String
+    public let example: String
+
+    enum CodingKeys: String, CodingKey {
+        case pattern
+        case meaningZH = "meaning_zh"
+        case example
+    }
+
+    public init(pattern: String, meaningZH: String, example: String) {
+        self.pattern = pattern
+        self.meaningZH = meaningZH
+        self.example = example
+    }
+}
+
 public struct GeneratedLearningGrade: Codable, Equatable, Sendable {
     public let verdict: LearningVerdict
     public let confidence: Double
     public let targetDemonstrated: Bool
     public let correctedAnswer: String
+    public let alternativeAnswers: [String]
     public let explanationZH: String
     public let issues: [String]
+    public let patterns: [LearningSentencePattern]
+    public let keyExplanationsZH: [String]
     public let followUp: LearningFollowUp
 
     enum CodingKeys: String, CodingKey {
@@ -461,9 +517,35 @@ public struct GeneratedLearningGrade: Codable, Equatable, Sendable {
         case confidence
         case targetDemonstrated = "target_demonstrated"
         case correctedAnswer = "corrected_answer"
+        case alternativeAnswers = "alternative_answers"
         case explanationZH = "explanation_zh"
         case issues
+        case patterns
+        case keyExplanationsZH = "key_explanations_zh"
         case followUp = "follow_up"
+    }
+}
+
+public struct GeneratedLearningGradeItem: Codable, Equatable, Sendable {
+    public let questionID: UUID
+    public let grade: GeneratedLearningGrade
+
+    enum CodingKeys: String, CodingKey {
+        case questionID = "question_id"
+        case grade
+    }
+
+    public init(questionID: UUID, grade: GeneratedLearningGrade) {
+        self.questionID = questionID
+        self.grade = grade
+    }
+}
+
+public struct GeneratedLearningGradeBatch: Codable, Equatable, Sendable {
+    public let grades: [GeneratedLearningGradeItem]
+
+    public init(grades: [GeneratedLearningGradeItem]) {
+        self.grades = grades
     }
 }
 
@@ -482,17 +564,52 @@ public struct SessionFocusSelectedPayload: Codable, Equatable, Sendable {
     public let knowledgePointID: String
     public let title: String
     public let reason: String
+    public let planKind: LearningSessionPlanKind
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID
+        case knowledgePointID
+        case title
+        case reason
+        case planKind
+    }
 
     public init(
         sessionID: UUID,
         knowledgePointID: String,
         title: String,
-        reason: String
+        reason: String,
+        planKind: LearningSessionPlanKind = .newMaterial
     ) {
         self.sessionID = sessionID
         self.knowledgePointID = knowledgePointID
         self.title = title
         self.reason = reason
+        self.planKind = planKind
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try container.decode(UUID.self, forKey: .sessionID)
+        knowledgePointID = try container.decode(String.self, forKey: .knowledgePointID)
+        title = try container.decode(String.self, forKey: .title)
+        reason = try container.decode(String.self, forKey: .reason)
+        planKind = try container.decodeIfPresent(
+            LearningSessionPlanKind.self,
+            forKey: .planKind
+        ) ?? .newMaterial
+    }
+}
+
+public enum LearningSessionPlanKind: String, Codable, CaseIterable, Sendable {
+    case dueReview = "due_review"
+    case newMaterial = "new_material"
+
+    public var title: String {
+        switch self {
+        case .dueReview: "Due review"
+        case .newMaterial: "New from your chats"
+        }
     }
 }
 
@@ -540,6 +657,33 @@ public struct AnswerGradedPayload: Codable, Equatable, Sendable {
     public let issues: [String]
     public let followUp: LearningFollowUp
     public let gradedAt: Date
+    public let alternativeAnswers: [String]
+    public let patterns: [LearningSentencePattern]
+    public let keyExplanationsZH: [String]
+    public let countsTowardMastery: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case gradeID
+        case sessionID
+        case questionID
+        case answerID
+        case knowledgePointID
+        case questionType
+        case usedHint
+        case isRetry
+        case verdict
+        case confidence
+        case targetDemonstrated
+        case correctedAnswer
+        case explanationZH
+        case issues
+        case followUp
+        case gradedAt
+        case alternativeAnswers
+        case patterns
+        case keyExplanationsZH
+        case countsTowardMastery
+    }
 
     public init(
         gradeID: UUID,
@@ -557,7 +701,11 @@ public struct AnswerGradedPayload: Codable, Equatable, Sendable {
         explanationZH: String,
         issues: [String],
         followUp: LearningFollowUp,
-        gradedAt: Date
+        gradedAt: Date,
+        alternativeAnswers: [String] = [],
+        patterns: [LearningSentencePattern] = [],
+        keyExplanationsZH: [String] = [],
+        countsTowardMastery: Bool = true
     ) {
         self.gradeID = gradeID
         self.sessionID = sessionID
@@ -575,6 +723,83 @@ public struct AnswerGradedPayload: Codable, Equatable, Sendable {
         self.issues = issues
         self.followUp = followUp
         self.gradedAt = gradedAt
+        self.alternativeAnswers = alternativeAnswers
+        self.patterns = patterns
+        self.keyExplanationsZH = keyExplanationsZH
+        self.countsTowardMastery = countsTowardMastery
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        gradeID = try container.decode(UUID.self, forKey: .gradeID)
+        sessionID = try container.decode(UUID.self, forKey: .sessionID)
+        questionID = try container.decode(UUID.self, forKey: .questionID)
+        answerID = try container.decode(UUID.self, forKey: .answerID)
+        knowledgePointID = try container.decode(String.self, forKey: .knowledgePointID)
+        questionType = try container.decode(LearningQuestionType.self, forKey: .questionType)
+        usedHint = try container.decode(Bool.self, forKey: .usedHint)
+        isRetry = try container.decode(Bool.self, forKey: .isRetry)
+        verdict = try container.decode(LearningVerdict.self, forKey: .verdict)
+        confidence = try container.decode(Double.self, forKey: .confidence)
+        targetDemonstrated = try container.decode(Bool.self, forKey: .targetDemonstrated)
+        correctedAnswer = try container.decode(String.self, forKey: .correctedAnswer)
+        explanationZH = try container.decode(String.self, forKey: .explanationZH)
+        issues = try container.decode([String].self, forKey: .issues)
+        followUp = try container.decode(LearningFollowUp.self, forKey: .followUp)
+        gradedAt = try container.decode(Date.self, forKey: .gradedAt)
+        alternativeAnswers = try container.decodeIfPresent(
+            [String].self,
+            forKey: .alternativeAnswers
+        ) ?? []
+        patterns = try container.decodeIfPresent(
+            [LearningSentencePattern].self,
+            forKey: .patterns
+        ) ?? []
+        keyExplanationsZH = try container.decodeIfPresent(
+            [String].self,
+            forKey: .keyExplanationsZH
+        ) ?? []
+        countsTowardMastery = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .countsTowardMastery
+        ) ?? true
+    }
+}
+
+public enum LearningBatchOutcome: String, Codable, CaseIterable, Sendable {
+    case passed
+    case reinforce
+    case paused
+}
+
+public struct BatchReviewCompletedPayload: Codable, Equatable, Sendable {
+    public let sessionID: UUID
+    public let batchID: UUID
+    public let knowledgePointID: String
+    public let successfulCount: Int
+    public let questionCount: Int
+    public let reinforcementRound: Int
+    public let outcome: LearningBatchOutcome
+    public let completedAt: Date
+
+    public init(
+        sessionID: UUID,
+        batchID: UUID,
+        knowledgePointID: String,
+        successfulCount: Int,
+        questionCount: Int,
+        reinforcementRound: Int,
+        outcome: LearningBatchOutcome,
+        completedAt: Date
+    ) {
+        self.sessionID = sessionID
+        self.batchID = batchID
+        self.knowledgePointID = knowledgePointID
+        self.successfulCount = successfulCount
+        self.questionCount = questionCount
+        self.reinforcementRound = reinforcementRound
+        self.outcome = outcome
+        self.completedAt = completedAt
     }
 }
 
@@ -648,6 +873,10 @@ public struct KnowledgePointSnapshot: Identifiable, Codable, Equatable, Sendable
     public let sourceExcerpt: String
     public let correctedForm: String
     public let explanationZH: String
+    public let reviewStage: Int
+    public let successfulReviewCount: Int
+    public let lastReviewedAt: Date?
+    public let lastReviewPassed: Bool
 
     public init(
         id: String,
@@ -665,7 +894,11 @@ public struct KnowledgePointSnapshot: Identifiable, Codable, Equatable, Sendable
         lastEvidenceAt: Date?,
         sourceExcerpt: String,
         correctedForm: String,
-        explanationZH: String
+        explanationZH: String,
+        reviewStage: Int = 0,
+        successfulReviewCount: Int = 0,
+        lastReviewedAt: Date? = nil,
+        lastReviewPassed: Bool = false
     ) {
         self.id = id
         self.title = title
@@ -683,6 +916,14 @@ public struct KnowledgePointSnapshot: Identifiable, Codable, Equatable, Sendable
         self.sourceExcerpt = sourceExcerpt
         self.correctedForm = correctedForm
         self.explanationZH = explanationZH
+        self.reviewStage = max(0, reviewStage)
+        self.successfulReviewCount = max(0, successfulReviewCount)
+        self.lastReviewedAt = lastReviewedAt
+        self.lastReviewPassed = lastReviewPassed
+    }
+
+    public var hasBeenPractised: Bool {
+        lastReviewedAt != nil || successfulReviewCount > 0
     }
 }
 
@@ -728,6 +969,7 @@ public struct LearningSessionSnapshot: Identifiable, Codable, Equatable, Sendabl
     public var focusKnowledgePointID: String?
     public var focusTitle: String
     public var focusReason: String
+    public var focusPlanKind: LearningSessionPlanKind
     public var attempts: [LearningAttemptSnapshot]
     public var outcome: LearningSessionCompletedPayload.Outcome?
     public var summary: String
@@ -740,6 +982,7 @@ public struct LearningSessionSnapshot: Identifiable, Codable, Equatable, Sendabl
         focusKnowledgePointID: String? = nil,
         focusTitle: String = "",
         focusReason: String = "",
+        focusPlanKind: LearningSessionPlanKind = .newMaterial,
         attempts: [LearningAttemptSnapshot] = [],
         outcome: LearningSessionCompletedPayload.Outcome? = nil,
         summary: String = ""
@@ -751,6 +994,7 @@ public struct LearningSessionSnapshot: Identifiable, Codable, Equatable, Sendabl
         self.focusKnowledgePointID = focusKnowledgePointID
         self.focusTitle = focusTitle
         self.focusReason = focusReason
+        self.focusPlanKind = focusPlanKind
         self.attempts = attempts
         self.outcome = outcome
         self.summary = summary
@@ -763,7 +1007,8 @@ public struct LearningSessionSnapshot: Identifiable, Codable, Equatable, Sendabl
     public var successfulAttemptCount: Int {
         attempts.filter {
             guard let grade = $0.grade else { return false }
-            return grade.verdict == .correct || grade.verdict == .acceptable
+            return grade.targetDemonstrated
+                && (grade.verdict == .correct || grade.verdict == .acceptable)
         }.count
     }
 
@@ -811,7 +1056,9 @@ public struct LearningDashboard: Codable, Equatable, Sendable {
 
     public var recommendedFocus: KnowledgePointSnapshot? {
         let now = Date()
-        return knowledgePoints.sorted { lhs, rhs in
+        return knowledgePoints.filter {
+            $0.dimension.isTrainable
+        }.sorted { lhs, rhs in
             let lhsDue = lhs.dueAt.map { $0 <= now } ?? false
             let rhsDue = rhs.dueAt.map { $0 <= now } ?? false
             if lhsDue != rhsDue {

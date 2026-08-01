@@ -37,7 +37,7 @@ struct MainContentView: View {
                     .allowsHitTesting(destination == .chat)
                     .accessibilityHidden(destination != .chat)
 
-                LearnView()
+                LearnView(isActive: destination == .learn)
                     .opacity(destination == .learn ? 1 : 0)
                     .allowsHitTesting(destination == .learn)
                     .accessibilityHidden(destination != .learn)
