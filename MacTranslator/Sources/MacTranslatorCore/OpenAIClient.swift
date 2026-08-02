@@ -18,6 +18,8 @@ public enum OpenAIClientError: LocalizedError {
 }
 
 public struct OpenAIClient: Sendable {
+    public static let defaultStructuredMaxOutputTokens = 20_000
+
     private static let structuredContentRetryInstructions = """
 
 
@@ -39,14 +41,18 @@ public struct OpenAIClient: Sendable {
         session: URLSession = .shared,
         diagnosticLogger: DiagnosticLogger = .shared,
         learningDebugStore: LearningDebugStore = .shared,
-        retryDelayNanoseconds: [UInt64] = [500_000_000, 1_000_000_000],
+        retryDelayNanoseconds: [UInt64] = [
+            500_000_000,
+            1_000_000_000,
+            2_000_000_000
+        ],
         backgroundPollIntervalNanoseconds: UInt64 = 2_000_000_000
     ) {
         self.endpoint = endpoint
         self.session = session
         self.diagnosticLogger = diagnosticLogger
         self.learningDebugStore = learningDebugStore
-        self.retryDelayNanoseconds = Array(retryDelayNanoseconds.prefix(2))
+        self.retryDelayNanoseconds = Array(retryDelayNanoseconds.prefix(3))
         self.backgroundPollIntervalNanoseconds = backgroundPollIntervalNanoseconds
     }
 
@@ -282,7 +288,7 @@ public struct OpenAIClient: Sendable {
         input: String,
         schemaName: String,
         schema: JSONValue,
-        maxOutputTokens: Int = 2_000,
+        maxOutputTokens: Int = OpenAIClient.defaultStructuredMaxOutputTokens,
         diagnosticContext: DiagnosticRequestContext = DiagnosticRequestContext(
             flow: "structured"
         ),
@@ -391,7 +397,7 @@ public struct OpenAIClient: Sendable {
     ) async throws -> StructuredResponsePayload {
         let requestID = UUID()
         let startedAt = Date()
-        let attempt = 1
+        var attempt = 0
         var responseText: String?
         var outputText: String?
         var tokenUsage: LearningTokenUsage?
@@ -400,25 +406,6 @@ public struct OpenAIClient: Sendable {
         var pollCount = 0
         let schemaText = (try? JSONEncoder().encode(schema))
             .flatMap { String(data: $0, encoding: .utf8) }
-
-        diagnosticLogger.requestStarted(
-            requestID: requestID,
-            attempt: attempt,
-            context: diagnosticContext,
-            model: model,
-            instructions: instructions,
-            input: input,
-            schemaName: schemaName,
-            schema: schemaText
-        )
-        learningDebugStore.requestStarted(
-            requestID: requestID,
-            flow: diagnosticContext.flow,
-            model: model,
-            instructions: instructions,
-            input: input,
-            attempt: attempt
-        )
 
         do {
             var request = URLRequest(url: endpoint)
@@ -445,18 +432,62 @@ public struct OpenAIClient: Sendable {
                 )
             )
 
-            let initialResult = try await sendBackgroundRequest(request)
-            responseText = String(data: initialResult.data, encoding: .utf8)
-            diagnosticLogger.responseReceived(
-                requestID: requestID,
-                attempt: attempt,
-                statusCode: initialResult.response.statusCode,
-                openAIRequestID: initialResult.response.value(
-                    forHTTPHeaderField: "x-request-id"
-                ),
-                headers: Self.responseHeaders(initialResult.response),
-                context: diagnosticContext
-            )
+            var createdResult: BackgroundResponseResult?
+            while createdResult == nil {
+                attempt += 1
+                diagnosticLogger.requestStarted(
+                    requestID: requestID,
+                    attempt: attempt,
+                    context: diagnosticContext,
+                    model: model,
+                    instructions: attempt == 1 ? instructions : nil,
+                    input: attempt == 1 ? input : nil,
+                    schemaName: attempt == 1 ? schemaName : nil,
+                    schema: attempt == 1 ? schemaText : nil
+                )
+                learningDebugStore.requestStarted(
+                    requestID: requestID,
+                    flow: diagnosticContext.flow,
+                    model: model,
+                    instructions: instructions,
+                    input: input,
+                    attempt: attempt
+                )
+                do {
+                    let result = try await sendBackgroundRequest(request)
+                    responseText = String(data: result.data, encoding: .utf8)
+                    diagnosticLogger.responseReceived(
+                        requestID: requestID,
+                        attempt: attempt,
+                        statusCode: result.response.statusCode,
+                        openAIRequestID: result.response.value(
+                            forHTTPHeaderField: "x-request-id"
+                        ),
+                        headers: Self.responseHeaders(result.response),
+                        context: diagnosticContext
+                    )
+                    createdResult = result
+                } catch {
+                    let retryIndex = attempt - 1
+                    guard Self.isRetryable(error),
+                          retryIndex < retryDelayNanoseconds.count,
+                          !Task.isCancelled else {
+                        throw error
+                    }
+                    let delay = retryDelayNanoseconds[retryIndex]
+                    diagnosticLogger.retryScheduled(
+                        requestID: requestID,
+                        attempt: attempt,
+                        delayMilliseconds: Int(delay / 1_000_000),
+                        failure: Self.diagnosticFailure(for: error),
+                        context: diagnosticContext
+                    )
+                    try await Task.sleep(nanoseconds: delay)
+                }
+            }
+            guard let initialResult = createdResult else {
+                throw OpenAIClientError.invalidResponse
+            }
 
             var envelope = initialResult.envelope
             openAIResponseID = envelope.id

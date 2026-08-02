@@ -643,7 +643,7 @@ public actor LearningEngine {
             schema: LearningPromptContracts.historyAnalysisSchema(
                 turnIDs: references.map(\.0)
             ),
-            maxOutputTokens: 4_000,
+            maxOutputTokens: OpenAIClient.defaultStructuredMaxOutputTokens,
             diagnosticContext: DiagnosticRequestContext(
                 flow: "learning_history_analysis",
                 operationID: operationID,
@@ -757,7 +757,7 @@ public actor LearningEngine {
             input: try encodeInput(request),
             schemaName: "english_learning_question_batch",
             schema: LearningPromptContracts.questionBatchSchema,
-            maxOutputTokens: 4_000,
+            maxOutputTokens: OpenAIClient.defaultStructuredMaxOutputTokens,
             diagnosticContext: DiagnosticRequestContext(
                 flow: "learning_question_batch_generation",
                 operationID: session.id,
@@ -890,7 +890,7 @@ public actor LearningEngine {
             schema: LearningPromptContracts.gradeBatchSchema(
                 questionIDs: references.map(\.0)
             ),
-            maxOutputTokens: 7_000,
+            maxOutputTokens: OpenAIClient.defaultStructuredMaxOutputTokens,
             diagnosticContext: DiagnosticRequestContext(
                 flow: "learning_answer_batch_grading",
                 operationID: session.id,

@@ -416,6 +416,10 @@ expect(
     "无效 reasoning effort 设置会回退到默认值"
 )
 expect(
+    OpenAIClient.defaultStructuredMaxOutputTokens == 20_000,
+    "所有结构化 Learn 请求统一使用 20000 output token 上限"
+)
+expect(
     KeychainError.from(status: errSecAuthFailed).requiresLoginKeychainReconnect,
     "Keychain 鉴权失败会进入重新连接流程"
 )
@@ -1354,7 +1358,7 @@ let retryClient = OpenAIClient(
     session: stubSession,
     diagnosticLogger: retryLogger,
     learningDebugStore: learningDebugStore,
-    retryDelayNanoseconds: [0, 0],
+    retryDelayNanoseconds: [0, 0, 0],
     backgroundPollIntervalNanoseconds: 0
 )
 let secretAPIKey = "sk-self-test-must-not-appear"
@@ -1452,9 +1456,11 @@ do {
 do {
     OpenAIStubURLProtocol.configure([
         .connectionLostBeforeText,
-        .structuredSuccess(#"{"value":"must not be requested"}"#)
+        .connectionLostBeforeText,
+        .connectionLostBeforeText,
+        .structuredSuccess(#"{"value":"recovered after three retries"}"#)
     ])
-    let _: StructuredSelfTestOutput = try await retryClient.structuredResponse(
+    let structured: StructuredSelfTestOutput = try await retryClient.structuredResponse(
         apiKey: secretAPIKey,
         model: "self-test-model",
         instructions: "Return structured JSON.",
@@ -1467,15 +1473,51 @@ do {
             flow: "learning_background_create_failure"
         )
     )
-    failures += 1
-    print("✗ Background 创建连接丢失应返回错误")
-} catch {
     expect(
-        OpenAIStubURLProtocol.requestCount == 1
-            && OpenAIStubURLProtocol.capturedRequestMethods == ["POST"],
-        "Background 创建结果不明确时不会重复 POST 并产生重复推理"
+        structured.value == "recovered after three retries",
+        "Background 创建连接丢失后会自动重试三次并恢复"
     )
+    expect(
+        OpenAIStubURLProtocol.requestCount == 4
+            && OpenAIStubURLProtocol.capturedRequestMethods == ["POST", "POST", "POST", "POST"],
+        "Background 创建最多执行首次请求加三次 POST 重试"
+    )
+    let debugEntry = learningDebugStore.entries().first {
+        $0.flow == "learning_background_create_failure"
+    }
+    expect(debugEntry?.attempt == 4, "Learn Debug 显示 Background 创建的最终 transport attempt")
+} catch {
+    failures += 1
+    print("✗ Background 创建断线重试自检出错：\(error.localizedDescription)")
 }
+
+OpenAIStubURLProtocol.configure([
+    .connectionLostBeforeText,
+    .connectionLostBeforeText,
+    .connectionLostBeforeText,
+    .connectionLostBeforeText,
+    .structuredSuccess(#"{"value":"fifth request must not happen"}"#)
+])
+var exhaustedBackgroundCreateDidFail = false
+do {
+    let _: StructuredSelfTestOutput = try await retryClient.structuredResponse(
+        apiKey: secretAPIKey,
+        model: "self-test-model",
+        instructions: "Return structured JSON.",
+        input: secretChatText,
+        schemaName: "background_create_exhausted_self_test",
+        schema: .strictObject(properties: [
+            "value": .object(["type": .string("string")])
+        ]),
+        diagnosticContext: DiagnosticRequestContext(
+            flow: "learning_background_create_exhausted"
+        )
+    )
+} catch {
+    exhaustedBackgroundCreateDidFail = true
+}
+expect(exhaustedBackgroundCreateDidFail, "Background 创建连续断线在三次重试后报告失败")
+expect(OpenAIStubURLProtocol.requestCount == 4, "Background 创建连续失败时不会发起第五次 POST")
 
 do {
     OpenAIStubURLProtocol.configure([
@@ -1595,6 +1637,7 @@ do {
     OpenAIStubURLProtocol.configure([
         .connectionLostBeforeText,
         .connectionLostBeforeText,
+        .connectionLostBeforeText,
         .success("Recovered")
     ])
     var output = ""
@@ -1606,8 +1649,8 @@ do {
     ) {
         output += delta
     }
-    expect(output == "Recovered", "未收到文字时最多重试两次并可在第三次恢复")
-    expect(OpenAIStubURLProtocol.requestCount == 3, "两次自动重试总计发起三次请求")
+    expect(output == "Recovered", "未收到文字时最多重试三次并可在第四次恢复")
+    expect(OpenAIStubURLProtocol.requestCount == 4, "三次自动重试总计发起四次请求")
 } catch {
     failures += 1
     print("✗ 无文字断线重试自检出错：\(error.localizedDescription)")
@@ -1617,7 +1660,8 @@ OpenAIStubURLProtocol.configure([
     .connectionLostBeforeText,
     .connectionLostBeforeText,
     .connectionLostBeforeText,
-    .success("Fourth attempt must not happen")
+    .connectionLostBeforeText,
+    .success("Fifth attempt must not happen")
 ])
 var exhaustedRetryDidFail = false
 do {
@@ -1630,8 +1674,8 @@ do {
 } catch {
     exhaustedRetryDidFail = true
 }
-expect(exhaustedRetryDidFail, "连续网络错误在两次重试后会报告失败")
-expect(OpenAIStubURLProtocol.requestCount == 3, "连续失败时不会发起第四次请求")
+expect(exhaustedRetryDidFail, "连续网络错误在三次重试后会报告失败")
+expect(OpenAIStubURLProtocol.requestCount == 4, "连续失败时不会发起第五次请求")
 
 OpenAIStubURLProtocol.configure([
     .partialTextThenConnectionLost("Partial"),
